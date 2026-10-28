@@ -1,0 +1,18 @@
+rules:
+  - id: user-input-in-system-prompt
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Function parameter interpolated into an LLM system prompt string. User-controlled text in
+      the system role gets higher priority than user turns (prompt injection). Validate strictly
+      (e.g. ObjectId.is_valid) or move it to a user/tool message.
+    patterns:
+      - pattern-inside: |
+          def $F(..., $P, ...):
+              ...
+      - pattern: |
+          f"...{$P}..."
+      - metavariable-regex:
+          metavariable: $F
+          regex: (?i).*(system|context|prompt|note).*
+    metadata: {class: prompt-injection, learned_from: "private QA run 2026-10-15"}

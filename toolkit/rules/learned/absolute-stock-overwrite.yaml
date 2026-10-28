@@ -1,0 +1,16 @@
+rules:
+  - id: absolute-counter-overwrite-on-update
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Update handler $set-s a document built from the client payload. If that payload carries
+      counters (stock, balance, quantity) read earlier by the client, concurrent decrements are
+      lost (lost update -> oversell). Exclude counters from $set or use $inc / a version check.
+    patterns:
+      - pattern-inside: |
+          @$ROUTER.put(...)
+          async def $H(...):
+              ...
+      - pattern: |
+          $COLL.update_one({"_id": $ID}, {"$set": $DOC(...)})
+    metadata: {class: lost-update, learned_from: "private QA run 2026-10-15"}

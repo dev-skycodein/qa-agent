@@ -1,0 +1,11 @@
+rules:
+  - id: html-injection-email-python
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Email HTML built from an f-string with an interpolation that is not passed through html.escape(). User text
+      reaches the recipient's mail client as markup (phishing links, fake content in a message that comes from you).
+    patterns:
+      - pattern: $F(..., html=f"...", ...)
+      - pattern-regex: 'html=\(?\s*f"[^"\n]*\{(?!\s*(html_lib|html|markupsafe)\.escape\(|\s*escape\(|[^}]*:\.?\d*[fd]\})'
+    metadata: {class: html-injection-email, learned_from: "private QA run seed S10 2026-10-16"}

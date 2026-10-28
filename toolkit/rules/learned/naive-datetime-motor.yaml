@@ -1,0 +1,14 @@
+rules:
+  - id: naive-datetime-motor-client
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Mongo client without tz_aware=True returns naive datetimes; APIs then emit
+      timestamps without offset and browsers parse them as LOCAL time. Pass tz_aware=True.
+    patterns:
+      - pattern-either:
+          - pattern: AsyncIOMotorClient(...)
+          - pattern: MongoClient(...)
+      - pattern-not: AsyncIOMotorClient(..., tz_aware=True, ...)
+      - pattern-not: MongoClient(..., tz_aware=True, ...)
+    metadata: {class: naive-datetime, learned_from: "private QA run 2026-10-15"}

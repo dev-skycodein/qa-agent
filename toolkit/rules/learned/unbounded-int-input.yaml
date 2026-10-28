@@ -1,0 +1,16 @@
+rules:
+  - id: unbounded-int-input
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Numeric input with a lower bound (ge=) but no upper bound (le=/lt=). Integers above int64
+      crash MongoDB (OverflowError -> 500); huge skip/limit is a cheap DoS. Add le=.
+    patterns:
+      - pattern-either:
+          - pattern: Query(..., ge=$X, ...)
+          - pattern: Field(..., ge=$X, ...)
+      - pattern-not: Query(..., le=$Y, ...)
+      - pattern-not: Query(..., lt=$Y, ...)
+      - pattern-not: Field(..., le=$Y, ...)
+      - pattern-not: Field(..., lt=$Y, ...)
+    metadata: {class: unbounded-int, learned_from: "private QA run 2026-10-15"}

@@ -1,0 +1,25 @@
+rules:
+  - id: regex-injection-mongo-python
+    languages: [python]
+    severity: WARNING
+    message: >-
+      User text is used as a MongoDB $regex pattern without re.escape(). Invalid patterns crash the query (500) and
+      crafted ones (".*", catastrophic backtracking) widen the match or burn CPU. Wrap the value in re.escape().
+    patterns:
+      - pattern: '{..., "$regex": $X, ...}'
+      - pattern-not: '{..., "$regex": re.escape(...), ...}'
+      - pattern-not: '{..., "$regex": f"...{re.escape(...)}...", ...}'
+      - pattern-not: '{..., "$regex": "...", ...}'
+    metadata: {class: regex-injection, learned_from: "private QA run seed S09 2026-10-16"}
+  - id: regex-injection-js
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Request data is compiled into a RegExp / $regex without escaping. Escape metacharacters first
+      (value.replace(/[.*+?^${}()|[\]\]/g, "\$&")) or use a plain contains/startsWith filter.
+    pattern-either:
+      - pattern: new RegExp(req.$A.$B, ...)
+      - pattern: new RegExp(req.$A, ...)
+      - pattern: '{ ..., $regex: req.$A.$B, ... }'
+      - pattern: '{ ..., $regex: req.$A, ... }'
+    metadata: {class: regex-injection, learned_from: "private QA run seed S09 2026-10-16"}
