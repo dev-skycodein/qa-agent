@@ -1,0 +1,6 @@
+{
+  "name": "qa-toolkit",
+  "version": "0.1.0",
+  "description": "Lean QA/bug-hunting toolkit: semgrep scan, diff review, sharp edges, variant analysis, false-positive check, insecure defaults, supply chain, property-based tests.",
+  "author": { "name": "Shameel Alvi" }
+}
