@@ -1,0 +1,10 @@
+# target registry entry: paths relative to the repository folder (or absolute)
+profile = "toolkit/examples/demo-flask-shop/qa-report/profile.json"
+spec = "toolkit/examples/demo-flask-shop/qa-spec.py"
+openapi = "toolkit/examples/demo-flask-shop/openapi.json"
+port = 8765
+examples = 40
+steps = 12
+engines = "authz,negative,stateful,race,scenario,static,invariants"
+# fresh database before every seed (run in the app dir by safe_run), so seeds are independent
+reset_cmd_argv = ["python", "-c", "import os,glob;[os.remove(f) for f in glob.glob('qa_demo_flask_shop.db')]"]

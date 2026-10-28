@@ -1,0 +1,23 @@
+[project]
+name = "qa-toolkit"
+version = "0.1.0"
+description = "Trust-first QA engines for HTTP/JSON APIs: findings only count when the engine proved it ran."
+requires-python = ">=3.10"
+dependencies = [
+    "hypothesis>=6.100",
+]
+
+[project.optional-dependencies]
+db = [
+    "pg8000>=1.30",
+    "pymongo>=4.6",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+markers = ["slow: runs qa_check.py --quick in a fresh clone (about 10 minutes); deselect with -m 'not slow'"]
