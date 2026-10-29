@@ -83,6 +83,44 @@ Claude reads the project, writes the spec, runs the engines, and writes a report
 
 If you run it headless (`claude -p`), the `Skill` tool must be in the allowed list, otherwise the command is not found. Example and details: [`docs/USING.md`](docs/USING.md).
 
+### What the plugin contains
+
+**Commands** (run with `/qa-toolkit:<name>`):
+
+| Command | What it does |
+|---|---|
+| `qa-hunt` | The full workflow on a project: detect the app, map it, write invariants, scan, run the engines, verify with proof-of-concept tests, and write a report |
+| `diff-review` | Security review of a code change (a PR, a commit, or a diff) |
+| `insecure-defaults` | Looks for fallback secrets, default credentials, fail-open checks, weak crypto, permissive access and debug leaks |
+
+**Skills** (Claude uses them when the task matches their description):
+
+| Skill | What it does | Needs |
+|---|---|---|
+| `differential-review` | Reviews what a code change alters: blast radius, test coverage of changed code | Git |
+| `fp-check` | Checks whether a suspected bug is real, with a true or false positive verdict and evidence | Nothing extra |
+| `property-based-testing` | Writes and reviews property-based tests (Hypothesis, fast-check, and others) | The test framework of your language |
+| `sarif-parsing` | Reads, merges and de-duplicates SARIF files from scanners. Does not run scans | A SARIF file |
+| `semgrep` | Runs a Semgrep scan with a plan you approve first | `semgrep` installed; its run script is bash, so on Windows it needs Git Bash or WSL. **Not tested on Windows** |
+| `security-audit` | Security review of code, APIs and services, with validators | On Windows the validators need WSL and Node 24. See `docs/USING.md` |
+| `sharp-edges` | Finds error-prone APIs and unsafe defaults in designs and configuration | Nothing extra |
+| `supply-chain-risk-auditor` | Checks dependencies for known advisories, abandoned packages and install scripts | Your lockfile |
+| `variant-analysis` | After a bug is found, looks for other places with the same root cause | Its queries run with Semgrep or CodeQL, if you use them; the search steps need nothing extra |
+
+**Agents** (started by the skills above; you do not call them directly):
+
+| Agent | Started by | What it does |
+|---|---|---|
+| `adversarial-modeler` | `differential-review` | Builds attacker scenarios for high-risk changes |
+| `data-flow-analyzer` | `fp-check` | Traces data from input to the dangerous place |
+| `exploitability-verifier` | `fp-check` | Checks whether a suspected bug can really be exploited |
+| `poc-builder` | `fp-check` | Writes a proof-of-concept test for a verified bug |
+| `sharp-edges-analyzer` | `sharp-edges` | Judges how easily an API can be misused |
+
+Some skills describe steps that use outside tools (for example `issue-writer` or `audit-context-building`). Those tools are **not** included, and the skill text says to skip such a step when the tool is missing.
+
+The skills, agents and commands were copied from Trail of Bits and Cloudflare material and changed for this toolkit. Their licences are in [`NOTICE.md`](NOTICE.md).
+
 ---
 
 ## Reading the results
