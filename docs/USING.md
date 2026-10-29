@@ -39,7 +39,7 @@ The engines need a Python file that tells them your users, your routes and how t
    - `setup(api)`: log in each user and return their auth headers. **Check the login response key**: the template uses `access_token`, the demo uses `token`. Use the key your API really returns.
    - `BODIES`: a valid request body for each route that creates data.
    - `OWNER`: which user owns the samples the engines create.
-3. Delete the last part of the copied file (from the line `# ---- scenario` to the end). It imports helpers by a path relative to the toolkit folder, which breaks in your own folder. Without it, the `race` and `scenario` engines report `SKIPPED`, which is expected.
+3. Keep `RACES` and the last part of the copied file (from the line `# ---- scenario` to the end), but rewrite them for your API: they use the demo's routes and fields. The `from scenarios_lib import ...` line works from your own folder, because `run.py` puts the engine folder on the import path before it loads the spec. Delete `RACES` or `SCENARIOS` only if you have nothing to put there; that engine then reports `SKIPPED`.
 4. Keep the spec to dummy data only. The engines create and change records.
 
 **If the report's first row is `setup` with `ERRORED`**, the spec did not run. Read the note. The usual cause is the login key in `setup()` (step 2) or a wrong email or password. Fix it and run again.
@@ -108,7 +108,8 @@ The plugin adds the command `/qa-toolkit:qa-hunt`. It runs the detect, map, inva
   `claude -p "/qa-toolkit:qa-hunt <path>" --plugin-dir <repo>/toolkit --allowedTools Skill Read Grep Glob Bash Write Edit Agent --max-budget-usd 5`
   Without `Skill` in the list, Claude reads the command text and does a manual review instead. That is not the toolkit's engine run.
 - Check the result in `<project>/qa-report/`: `engines.md` says which engine ran, which degraded and which was skipped, and `trust.json` gives the verdict. A `PARTIAL` verdict means some checks did not run.
-- The `scan` step uses `scripts/scan.ps1`, which is Windows PowerShell only. The engines need Python 3.12 (see Dependencies in the README).
+- The `scan` step uses `scripts/scan.py` (plain Python). The engines need Python 3.12 (see Dependencies in the README).
+- `/qa-hunt` must call its required skills (`fp-check`, `sharp-edges`, `insecure-defaults`, `sarif-parsing`, `variant-analysis`, and `differential-review` with `--diff`). The report ends with a `## Skills used` table; a missing row means that part of the hunt did not run.
 
 ## Source-code review (optional)
 `toolkit/skills/security-audit/` is Cloudflare's `security-audit` skill (MIT, see `NOTICE.md`). It reviews source code, not a running API. Our additions are a Windows note in `SKILL.md` and `validate-wsl.ps1`. The validators are unchanged.

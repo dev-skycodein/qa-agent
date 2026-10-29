@@ -87,6 +87,7 @@ def run(api, doc, qa=None) -> dict:
             continue
         inspected += 1
         issuing = bool(ISSUE_PATH.search(e["path"])) and e["method"] in ("POST", "PUT")
+        sent = e.get("request") if isinstance(e.get("request"), dict) else {}
         for fpath, value in _walk(body):
             leaf = _norm(fpath.rsplit(".", 1)[-1].replace("[*]", ""))
             if value is None or isinstance(value, bool) or value == "" or SAFE_NAME.search(leaf):
@@ -99,6 +100,9 @@ def run(api, doc, qa=None) -> dict:
                 continue
             if not (by_name or by_value):
                 continue
+            raw_leaf = fpath.rsplit(".", 1)[-1].replace("[*]", "")
+            if not (by_value or strong_name) and raw_leaf in sent and sent[raw_leaf] == value:
+                continue    # a weak name echoing the caller's own value (e.g. the negative engine's mass-assign probe) is not a leak
             ep = e["method"] + " " + ID_SEGMENT.sub("/{id}", e["path"])
             key = (ep, fpath)
             if key in seen or f"{ep} {fpath}" in allow:

@@ -77,3 +77,27 @@ if __name__ == "__main__":
         fn()
         print("ok  ", name)
     print(f"EXPOSURE OK: {len(tests)} tests")
+
+
+def _with_request(entries):
+    """FakeApi whose log entries also carry the request body, as api.Api logs it."""
+    fake = FakeApi([(m, p, s, b) for m, p, s, b, _ in entries])
+    for row, (*_, sent) in zip(fake.log, entries):
+        row["request"] = sent
+    return fake
+
+
+def test_weak_name_echoing_the_callers_own_value_is_quiet():
+    # the negative engine's mass-assign probe sends deluxeToken="x"; an app that echoes unknown fields must not be a leak
+    r = exposure.run(_with_request([("POST", "/items", 201, {"id": 1, "deluxeToken": "x"}, {"name": "a", "deluxeToken": "x"})]), {})
+    assert r["findings"] == []
+
+
+def test_weak_name_with_a_value_the_caller_did_not_send_is_still_reported():
+    r = exposure.run(_with_request([("POST", "/items", 201, {"id": 1, "deluxeToken": "server-made"}, {"deluxeToken": "x"})]), {})
+    assert [f["severity"] for f in r["findings"]] == ["low"]
+
+
+def test_echoed_password_is_still_high():
+    r = exposure.run(_with_request([("POST", "/users", 201, {"id": 1, "password": "hunter2"}, {"password": "hunter2"})]), {})
+    assert [f["severity"] for f in r["findings"]] == ["high"], "echoing a password back is a real leak, never excused"

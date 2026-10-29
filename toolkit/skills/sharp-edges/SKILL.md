@@ -24,7 +24,7 @@ Evaluates whether APIs, configurations, and interfaces are resistant to develope
 
 ## Agent
 
-The `sharp-edges-analyzer` agent runs the full sharp edges analysis workflow autonomously. Use it when you want a dedicated analysis of APIs, configurations, or interfaces for misuse resistance and footgun potential. The agent follows the four-phase workflow (Surface Identification, Edge Case Probing, Threat Modeling, Validate Findings) and reads language-specific references on demand.
+The `qa-toolkit:sharp-edges-analyzer` agent (pass that full namespaced name as `subagent_type`; a bare `sharp-edges-analyzer` is unregistered and the dispatch fails at runtime) runs the full sharp edges analysis workflow autonomously. Use it when you want a dedicated analysis of APIs, configurations, or interfaces for misuse resistance and footgun potential. The agent follows the four-phase workflow (Surface Identification, Edge Case Probing, Threat Modeling, Validate Findings) and reads language-specific references on demand.
 
 ## Core Principle
 

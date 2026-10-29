@@ -31,10 +31,12 @@ The target signature is the one OBSERVED on the original sequence, not the one w
 Reproducibility: the minimal sequence is replayed R times (default 5) on fresh state. k/n and the Wilson 95% lower
 bound are reported. 0 < k < n -> reported as FLAKY (degraded), never as confirmed. k = 0 -> setup_failed, no PoC.
 
-Fresh state: every trial calls the user-supplied reset() first (wire it to safe_run's reset_cmd, see the CLI and
-docs/design/engine-shrink.md). Without reset() the status is degraded: trials share app state.
+Fresh state: every trial calls the user-supplied reset() first (wire it to safe_run's reset_cmd, see the CLI). The reset
+runs while the app is up, so it must work against a live app (truncate tables, call a test-only reset route); a reset that
+only works while the app is stopped is not enough. Without reset() the status is degraded: trials share app state.
 
-Limits: see docs/design/engine-shrink.md (reset dependence, flaky bugs, id substitution gaps, budget).
+Limits: results depend on that reset; flaky bugs are reported as FLAKY, never confirmed; ids are substituted only where a
+step's {{step_N.id}} placeholder links them; max_trials caps the budget.
 
 Module use:
     from shrink import shrink_finding, five_xx, parse_sequence_text

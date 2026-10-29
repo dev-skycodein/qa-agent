@@ -169,7 +169,7 @@ Each finding names the endpoint, the role that got through, the status it got an
 
 | Path | What it is |
 |---|---|
-| `toolkit/engine/` | The engines. Core: `authz`, `negative`, `stateful`, `race`, `scenario`, `static`. Experimental (no measured recall yet): `schema`, `auth`, `exposure`, `differential`, `workflow`, `metamorphic`, `logic` |
+| `toolkit/engine/` | The engines. Core: `authz`, `negative`, `stateful`, `race`, `scenario`, `static`. Also run by `/qa-hunt`, no measured recall yet: `auth`, `exposure`. Experimental (not run by `/qa-hunt`, no measured recall yet): `schema`, `differential`, `workflow`, `metamorphic`, `logic` |
 | `toolkit/engine/run.py` | Runs the engines against a spec. `--preflight` checks the spec without sending attack traffic |
 | `toolkit/engine/safe_run.py` | Starts your app locally with a sink that records outbound traffic |
 | `toolkit/engine/invariant_miner.py` | Proposes candidate rules from observed responses. A proposal is not a finding |
@@ -185,7 +185,7 @@ Each finding names the endpoint, the role that got through, the status it got an
 Nothing here is bundled. Checked against the scripts.
 
 - **Python 3.12** for the engines: `python -m uv run --no-project --python 3.12 --with hypothesis ...`. `qa_console.py` runs with plain `python`.
-- **`scan.ps1`** (Windows PowerShell only) runs `semgrep` (needed for the static step), `gitleaks`, `osv-scanner`, `trivy`, `ubs` and `schemathesis` if they are on PATH, and skips missing ones with a message.
+- **`scan.py`** (plain Python, used by `/qa-hunt`) runs `semgrep` (needed for the static step), `gitleaks`, `osv-scanner`, `trivy`, `ubs` and `schemathesis` if they are on PATH, and skips missing ones with a message. It skips a tool that is only a `.cmd`/`.bat` shim. The older `scan.ps1` (Windows PowerShell only) does the same and is kept.
 - **`e2e_crawl.py`** needs Playwright and Chromium: `python -m uv run --with playwright playwright install chromium`.
 - **`dbcheck.py`** needs `pg8000` (PostgreSQL) or `pymongo` (MongoDB): add `--with pg8000` or `--with pymongo` to the run.
 

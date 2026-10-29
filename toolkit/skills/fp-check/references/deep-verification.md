@@ -61,13 +61,14 @@ For each bug (Bug #N), create one task per phase with the dependency structure b
 
 ## Agents
 
-Delegate these agents to their respective phases. Pass the bug description and any prior phase results as context.
+Delegate these agents to their respective phases. Pass the bug description and any prior phase results as context. Pass the full
+namespaced name below as `subagent_type`: a bare name such as `poc-builder` is unregistered and the dispatch fails at runtime.
 
 | Agent | Phases | Purpose |
 |-------|--------|---------|
-| `data-flow-analyzer` | 1.1–1.4 | Trace data flow, map trust boundaries, check API contracts and environment protections |
-| `exploitability-verifier` | 2.1–2.4 | Prove attacker control, mathematical bounds, race condition feasibility |
-| `poc-builder` | 4.1–4.5 | Create pseudocode, executable, unit test, and negative PoCs |
+| `qa-toolkit:data-flow-analyzer` | 1.1–1.4 | Trace data flow, map trust boundaries, check API contracts and environment protections |
+| `qa-toolkit:exploitability-verifier` | 2.1–2.4 | Prove attacker control, mathematical bounds, race condition feasibility |
+| `qa-toolkit:poc-builder` | 4.1–4.5 | Create pseudocode, executable, unit test, and negative PoCs |
 
 Phases 3 (Impact Assessment), 5 (Devil's Advocate), and the Gate Review are handled directly — they require synthesizing results across phases and should not be delegated.
 
