@@ -245,6 +245,12 @@ def extract_id(body):
 
 # ---------- schema -> example ----------
 
+# One valid value per string format, shared by example() and strategy(). Same uuid as schema_fuzz.SAMPLE (v4, RFC 4122 variant).
+FORMAT_SAMPLES = {"email": "qa@example.com", "date-time": "2026-01-01T00:00:00Z", "date": "2026-01-01",
+                  "uuid": "3f2504e0-4f89-41d3-9a0c-0305e82c3301", "uri": "https://example.com/qa",
+                  "ipv4": "192.0.2.1", "hostname": "qa.example.com"}     # ipv4: TEST-NET-1 (RFC 5737), never routed
+
+
 def example(schema, spec, depth=0):
     """Smallest valid-looking value for a JSON schema."""
     schema = resolve(schema, spec)
@@ -271,10 +277,9 @@ def example(schema, spec, depth=0):
         return int(value) if t == "integer" else float(value)
     if t == "boolean":
         return True
-    if fmt == "email":
-        return "qa@example.com"
-    if fmt == "date-time":
-        return "2026-01-01T00:00:00Z"
+    if fmt in FORMAT_SAMPLES:
+        return FORMAT_SAMPLES[fmt]
+    # `pattern` is NOT honoured: a pattern-only string still gets the plain "qa..." value below; give the schema an example or enum instead.
     n = max(schema.get("minLength", 1), 1)
     return ("qa" * n)[:max(n, 2) if schema.get("maxLength", 99) >= 2 else schema["maxLength"]]
 
@@ -308,7 +313,8 @@ def strategy(schema, spec, depth=0):
                          allow_nan=False, allow_infinity=False)
     if t == "boolean":
         return st.booleans()
-    if schema.get("format") == "email":
-        return st.just("qa@example.com")
+    if schema.get("format") in FORMAT_SAMPLES:
+        return st.just(FORMAT_SAMPLES[schema["format"]])
+    # `pattern` is NOT honoured: a pattern-only string still draws plain printable text.
     lo, hi = schema.get("minLength", 0), min(schema.get("maxLength", 20), 20)
     return st.text(alphabet=st.characters(min_codepoint=32, max_codepoint=126), min_size=lo, max_size=max(lo, hi))

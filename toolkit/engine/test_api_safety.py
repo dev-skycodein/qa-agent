@@ -28,6 +28,9 @@ class Server:
 
             def _any(self):
                 outer.seen.append((self.path, dict(self.headers.items())))
+                # Drain the request body before answering. Closing a socket with unread inbound data makes Windows send
+                # RST instead of FIN, which can abort the client's read of this very response (WinError 10053).
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 if outer.redirect:
                     self.send_response(302)
                     self.send_header("Location", outer.redirect)
