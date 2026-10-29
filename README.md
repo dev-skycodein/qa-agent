@@ -13,6 +13,7 @@ It is a measurement instrument, not an oracle. A finding is a lead to reproduce.
 | `toolkit/engine/safe_run.py` | Starts your app locally with a sink that records outbound traffic. Shell commands need explicit trust |
 | `qa_console.py` | Browses run results in a local, token-protected page |
 | `qa_check.py` | Health check of the toolkit (`--quick`, `--full`) |
+| `toolkit/engine/invariant_miner.py` | Proposes candidate invariants from observed responses. Information only: a proposal is not a finding |
 | `toolkit/skills/`, `toolkit/agents/`, `toolkit/commands/` | Claude Code skills, agents and commands built on the engines. They run inside Claude Code; see below |
 | `docs/USING.md` | Step-by-step guide: setup, spec, first run, reading results, limits |
 
@@ -61,6 +62,18 @@ Known limits: counters that drift, error-code mismatches such as 422 versus 413,
 - Keys live in a gitignored `.env` file. Never paste a key into a command.
 - A shell command from a profile runs only when the profile says `trusted: true`, which you set yourself for a profile you have reviewed. Prefer argv lists (`run_cmd_argv`, `reset_cmd_argv`).
 - Run folders contain request traces and, for the engines, test data. Check them before you share them.
+
+## Dependencies
+
+Nothing here is bundled. What each part needs (checked against the scripts):
+- **Python 3.12** for the engines (`python -m uv run --no-project --python 3.12 --with hypothesis ...`). `qa_console.py` runs with plain `python`.
+- **`scan.ps1`** (Windows PowerShell only; there is no bash version) runs these if they are on PATH and skips them with a message if not: `semgrep` (required for the static step), `gitleaks`, `osv-scanner`, `trivy` (optional), `ubs` (optional, called through bash), `schemathesis` (only with `-ApiUrl`).
+- **`e2e_crawl.py`** needs Playwright and a Chromium it can drive (`python -m uv run --with playwright playwright install chromium`).
+- **`dbcheck.py`** needs `pg8000` (PostgreSQL) or `pymongo` (MongoDB) for the database checks; pass `--with pg8000` or `--with pymongo` on the run.
+
+## LLM helper (optional, off by default)
+
+`toolkit/synthesize.py` and `toolkit/rules_from_llm.py` send content to an LLM provider, and only when you name one (`--provider`, `--key-env`, `--api-url`, `--model`, or the matching `QA_LLM_*` variables in `.env`). What they send: the endpoint list from the OpenAPI document (paths, body field names, examples), and with `--source` short snippets of route-handler code. It goes to the URL you give, with the key read from the environment variable you name; redirects are refused. Do not point it at a server you do not trust with your code. `synthesize.py` screens its generated spec for `os`, `subprocess`, `eval`, `exec` and similar before writing it, and refuses to write on a match. This is a screen, not a sandbox. `rules_from_llm.py` is not covered by that screen.
 
 ## Tested on
 

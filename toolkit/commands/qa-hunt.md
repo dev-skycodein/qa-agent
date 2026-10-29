@@ -53,6 +53,6 @@ Run Python tools with `python -m uv run --no-project --python 3.12 --with <deps>
 7. **Variants.** Each confirmed bug → `variant-analysis` skill.
 8. **PoC or drop.** Each candidate needs a failing test in `qa-report/poc/`. No PoC → `fp-check`; still unproven → drop or mark "code trace only".
 9. **Report** `qa-report/REPORT.md`: `| severity | file:line | class | bug | poc | fix |`. Separate "proven" vs "code trace". State assumptions as assumptions.
-10. **Learn (user-confirmed bugs only).** Semgrep rule → `${CLAUDE_PLUGIN_ROOT}/rules/learned/<class>.yaml` (must hit the bug, not the fix) + keep PoC as regression test.
+10. **Learn (user-confirmed bugs only).** Semgrep rule → `${CLAUDE_PLUGIN_ROOT}/rules/learned/<class>.yaml` (must hit the bug, not the fix) + keep PoC as regression test. A plugin update can overwrite files in the plugin folder, so keep a copy of learned rules outside it.
 
 Rules: no style nits, no theoretical issues, >80% confidence only. Don't fix code unless user asks.

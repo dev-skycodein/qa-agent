@@ -38,7 +38,7 @@ Run a Semgrep scan with automatic language detection, parallel execution, and me
 - Binary analysis → Use binary analysis tools
 - Already have Semgrep CI configured → Use existing pipeline
 - Need cross-file analysis but no Pro license → Consider CodeQL as alternative
-- Creating custom Semgrep rules → Use `semgrep-rule-creator` skill
+- Creating custom Semgrep rules → write the rule by hand (the `semgrep-rule-creator` skill is not shipped in this toolkit)
 - Porting existing rules to other languages → Use `semgrep-rule-variant-creator` skill
 
 ## Output Directory

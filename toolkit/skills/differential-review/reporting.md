@@ -346,7 +346,7 @@ Next steps:
 
 ---
 
-## Integration with issue-writer
+## Integration with issue-writer (optional; not shipped in this toolkit)
 
 After generating differential review, transform into audit report:
 

@@ -74,7 +74,7 @@ Phase 3: Blast Radius → Phase 4: Deep Context → Phase 5: Adversarial → Pha
 ├─ Analyzing HIGH RISK change?
 │  ├─ Read: adversarial.md
 │  │  (Phase 5: Attacker modeling, exploit scenarios, exploitability rating)
-│  └─ Or delegate to: differential-review:adversarial-modeler agent
+│  └─ Or delegate to: the adversarial-modeler agent (toolkit/agents/)
 │     (Autonomous attacker modeling with concrete exploit scenarios)
 │
 ├─ Writing the final report?
@@ -93,7 +93,7 @@ Phase 3: Blast Radius → Phase 4: Deep Context → Phase 5: Adversarial → Pha
 
 ## Agents
 
-**`differential-review:adversarial-modeler`** — Models attacker perspectives and
+**`adversarial-modeler`** (toolkit/agents/) — Models attacker perspectives and
 builds exploit scenarios for HIGH RISK code changes. Follows the 5-step
 adversarial methodology (attacker model, attack vectors, exploitability rating,
 exploit scenario, baseline cross-reference) and produces structured vulnerability
@@ -119,11 +119,11 @@ Before delivering:
 
 ## Integration
 
-**audit-context-building skill:**
+**audit-context-building skill (not shipped in this toolkit; skip the step if it is not installed):**
 - Pre-Analysis: Build baseline context
 - Phase 4: Deep context on HIGH RISK changes
 
-**issue-writer skill:**
+**issue-writer skill (not shipped in this toolkit; optional):**
 - Transform findings into formal audit reports
 - Command: `issue-writer --input DIFFERENTIAL_REVIEW_REPORT.md --format audit-report`
 
@@ -156,8 +156,8 @@ Time: ~3-4 hours
 ### Deep Audit (Large, Critical Change)
 ```
 Input: 450 files, auth system rewrite
-Strategy: SURGICAL + audit-context-building
-1. Baseline context with audit-context-building
+Strategy: SURGICAL (+ audit-context-building if installed)
+1. Baseline context by reading the code (audit-context-building is optional)
 2. Deep analysis on auth changes only
 3. Blast radius analysis
 4. Adversarial modeling

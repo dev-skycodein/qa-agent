@@ -17,10 +17,10 @@ manifestations, and they are rarely in the module where you found the first one.
 
 ## When NOT to Use
 
-- Initial vulnerability discovery — use audit-context-building or a domain-specific audit
+- Initial vulnerability discovery — use a domain-specific audit (audit-context-building is not shipped in this toolkit)
 - General code review with no known pattern to search for
-- Writing fix recommendations — use issue-writer
-- Understanding unfamiliar code — use audit-context-building first
+- Writing fix recommendations — write them by hand (issue-writer is not shipped in this toolkit)
+- Understanding unfamiliar code — read it first (audit-context-building is not shipped in this toolkit)
 
 ## The Five Steps
 
@@ -49,8 +49,8 @@ false-positive filters
 
 ## Running it as a Workflow
 
-This plugin ships `/variant-analysis:variants`, which runs the five steps across parallel
-subagents — one per expansion axis, looping until the sweep stops finding anything new.
+The upstream Trail of Bits plugin ships `/variant-analysis:variants`, which runs the five steps across parallel
+subagents. **This toolkit does not include that command.** Here the five steps are run by hand, one expansion axis at a time, looping until the sweep stops finding anything new.
 Each stage reads the reference above that matches its job.
 
 Use the workflow when the codebase is large or the root cause has many manifestations. Work
