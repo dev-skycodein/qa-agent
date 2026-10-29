@@ -1,5 +1,7 @@
 # Usage: powershell -File scan.ps1 [path] [-ApiUrl http://localhost:8000/openapi.json] [-ExcludePaths "^/(chat|search)"]
 #   -> writes qa-report/* in target. ApiUrl must be LOCAL, never production.
+#   Windows PowerShell only (no bash version). Each tool is optional: a missing one is printed and skipped.
+#   -ExcludePaths defaults to a pattern set for one project (chat/search): change it for your API.
 param([string]$Path = ".", [string]$ApiUrl = "", [string]$ExcludePaths = "^/(chat|search)")
 if ($ApiUrl -and ($ApiUrl -notmatch '^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)')) {
   [Console]::Error.WriteLine("ApiUrl must be a local URL (127.0.0.1, localhost or [::1]); refusing $ApiUrl"); exit 2

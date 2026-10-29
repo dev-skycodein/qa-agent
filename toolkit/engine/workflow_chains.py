@@ -372,6 +372,8 @@ def run(api, spec_doc, qa) -> dict:
         return trust.mark(res, trust.SKIPPED, "no create->action chain: no POST /x/{x_id}/<verb> style operation")
     if ctx.probes == 0:
         return trust.mark(res, trust.DEGRADED, "no request was sent: nothing was checked")
+    if not ch.actions:   # only the idempotency probe ran: the chain oracles (balance, owner, terminal, repeat) never ran
+        return trust.mark(res, trust.DEGRADED, "no create->action chain: only the idempotency probe ran; chain oracles not run")
     reasons = []
     if budget_hit:
         reasons.append("write budget spent")

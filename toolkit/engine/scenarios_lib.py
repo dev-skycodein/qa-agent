@@ -23,21 +23,29 @@ double_submit(name, make_request, count, role, n=2)
 import itertools
 
 
+class SetupFailed(Exception):
+    """The scenario's precondition could not be established, so its check never ran. The scenario engine reports
+    setup_failed for it (never a silent pass, never a finding)."""
+
+
 def state_machine(name, states, allowed, reach, get_state, transition, role):
     def run(api, ctx):
-        bad = []
+        bad, tried = [], 0
         for frm, to in itertools.permutations(states, 2):
             if (frm, to) in allowed:
                 continue
             ref = reach(api, ctx, frm)
             if ref is None:
                 continue
+            tried += 1
             resp = transition(api, role, ref, to)
             now = get_state(api, ref)
             if resp.ok and now == to:
                 bad.append(f"{frm} -> {to}")
             elif resp.status >= 500:
                 bad.append(f"{frm} -> {to} (5xx)")
+        if not tried:
+            raise SetupFailed("no state could be reached: no transition was tested")
         return f"illegal transitions accepted: {', '.join(bad)}" if bad else None
     return {"name": name, "run": run}
 
@@ -47,7 +55,7 @@ def stale_session(name, login, protected, revoke):
         headers = login(api)
         before = protected(api, headers)
         if not before.ok:
-            return None                                  # cannot establish the precondition: not a finding
+            raise SetupFailed(f"protected route answered {before.status} before the revoke: nothing was tested")
         revoke(api, ctx)
         after = protected(api, headers)
         if after.ok:
@@ -59,7 +67,7 @@ def reuse_after_logout(name, login, logout, protected):
     def run(api, ctx):
         headers = login(api)
         if not protected(api, headers).ok:
-            return None
+            raise SetupFailed("protected route did not answer 2xx with the fresh token: nothing was tested")
         logout(api, headers)
         after = protected(api, headers)
         if after.ok:

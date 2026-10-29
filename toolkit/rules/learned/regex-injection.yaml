@@ -10,7 +10,7 @@ rules:
       - pattern-not: '{..., "$regex": re.escape(...), ...}'
       - pattern-not: '{..., "$regex": f"...{re.escape(...)}...", ...}'
       - pattern-not: '{..., "$regex": "...", ...}'
-    metadata: {class: regex-injection, learned_from: "private QA run seed S09 2026-10-16"}
+    metadata: {class: regex-injection, learned_from: "internal testing seed S09 2026-10-16"}
   - id: regex-injection-js
     languages: [javascript, typescript]
     severity: WARNING
@@ -22,4 +22,4 @@ rules:
       - pattern: new RegExp(req.$A, ...)
       - pattern: '{ ..., $regex: req.$A.$B, ... }'
       - pattern: '{ ..., $regex: req.$A, ... }'
-    metadata: {class: regex-injection, learned_from: "private QA run seed S09 2026-10-16"}
+    metadata: {class: regex-injection, learned_from: "internal testing seed S09 2026-10-16"}

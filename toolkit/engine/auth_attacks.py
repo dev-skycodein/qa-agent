@@ -126,7 +126,7 @@ def _tampered(payload: dict) -> dict:
     tampered = dict(payload)
     if "sub" in tampered:
         v = tampered["sub"]
-        tampered["sub"] = v + 1 if isinstance(v, int) else (str(int(v) + 1) if str(v).isdigit() else f"{v}-qa")
+        tampered["sub"] = v + 1 if isinstance(v, int) else (str(int(v) + 1) if str(v).isdecimal() else f"{v}-qa")
     tampered.update({"role": "admin", "admin": True, "is_admin": True})
     return tampered
 
@@ -833,7 +833,8 @@ def _enum(ctx):
     ep = f"POST {login['path']}"
 
     def norm(text):
-        return text.replace(user, "<USER>").replace(unknown, "<USER>")
+        text = text.replace(user, "<USER>").replace(unknown, "<USER>")
+        return re.sub(r"[0-9a-f]{8,}|\d+", "#", text)     # per-request trace/request ids, as in _norm_answer
     if nouser.status != wrong.status or norm(nouser.text) != norm(wrong.text):
         ctx.add(check, "medium", ep, "failed-login answers differ between an unknown user and a wrong password: valid accounts can be listed",
                 control=f"wrong password for a real user -> {wrong.status} {_short(wrong.text)!r}",
@@ -1008,7 +1009,7 @@ def run(api, spec_doc, qa) -> dict:
     if not creds:
         return trust.mark({"engine": "auth", "findings": [], "notes": ["no Bearer or Cookie credential in any role and qa.LOGIN gave none"],
                            "probes": ctx.probes},
-                          trust.SKIPPED, "no auth detected: no role has a Bearer/Cookie credential and qa.LOGIN did not yield one")
+                          trust.SKIPPED, "no Bearer/Cookie credential to test (Basic and other schemes are not read) and qa.LOGIN did not yield one")
 
     _resolve_flows(ctx, creds[0])
     creds = [_fresh(ctx, c) for c in creds]          # short-lived tokens from the spec's setup are renewed first

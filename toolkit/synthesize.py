@@ -5,9 +5,14 @@ Usage:
   python toolkit/synthesize.py --openapi path/to/openapi.json \
     [--source path/to/code/] [--out projects/target/qa-spec.py]
 
-Requires: GEMINI_API_KEY (environment or .env; free tier: aistudio.google.com)
+The LLM helper is OPTIONAL and OFF by default. The core QA engines do not need it. To opt in, name the provider, the key variable,
+the endpoint and the model explicitly, e.g.:
+  python toolkit/synthesize.py --openapi ... --provider NAME --key-env VAR --api-url URL --model MODEL
+(the endpoint may also come from QA_LLM_API_URL and the model from QA_LLM_MODEL, in the gitignored .env). The key is read from the
+environment variable named by --key-env. No provider URL or key is built in.
 """
 import argparse
+import ast
 import json
 import os
 import re
@@ -27,26 +32,37 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
-DEFAULT_MODEL = "gemini-3.5-flash"
-DEFAULT_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 MAX_CONTINUATION = 4
 
-# Provider presets. SkyCodein (hosted OpenAI-compatible service) adds ~550 prompt tokens of its own, answers at most
-# 2048 tokens and keeps only the newest messages that fit in 8000 characters: a bigger prompt is silently cut, so it is refused here.
+OPT_IN_HINT = ("The LLM helper is optional and OFF by default: the core QA engines need no LLM service. To opt in, pass "
+               "--provider NAME --key-env VAR --api-url URL --model MODEL (or set QA_LLM_API_URL / QA_LLM_MODEL in .env).")
+
+# Provider LIMITS only. No provider is the default, and no endpoint or key variable is built in: each must be named by the user.
+# SkyCodein (company/hosted OpenAI-compatible service, see API.md) answers at most 2048 tokens and keeps only the newest messages that
+# fit in 7500 characters: a bigger prompt is silently cut, so it is refused here.
 PROVIDERS = {
-    "gemini": {"api_url": DEFAULT_API_URL, "model": DEFAULT_MODEL, "key_env": "GEMINI_API_KEY", "max_tokens": None, "context_chars": None},
-    "skycodein": {"api_url": "https://theskyscripters.online/v1/chat/completions", "model": "skycodein-coder",
-                  "key_env": "SKY_CODEIN_KEY", "max_tokens": 2048, "context_chars": 7500},
+    "gemini": {"max_tokens": None, "context_chars": None},
+    "skycodein": {"max_tokens": 2048, "context_chars": 7500},
 }
 
 
-def provider_settings(name, api_url=None, model=None, max_tokens=None):
-    """Resolved {api_url, model, key_env, max_tokens, context_chars} for a provider; explicit values win, max_tokens is clamped."""
+def provider_settings(name=None, api_url=None, model=None, max_tokens=None, key_env=None):
+    """Resolved {api_url, model, key_env, max_tokens, context_chars} for an explicitly chosen provider.
+
+    Refuses (SystemExit, no network) unless the provider, the key variable, the endpoint and the model are all given, either as
+    arguments or (endpoint, model) from QA_LLM_API_URL / QA_LLM_MODEL. max_tokens is clamped to the provider's limit."""
+    if not name:
+        raise SystemExit(OPT_IN_HINT + " No --provider was given.")
     if name not in PROVIDERS:
         raise SystemExit(f"unknown provider {name!r}: choose one of {sorted(PROVIDERS)}")
     cfg = dict(PROVIDERS[name])
-    cfg["api_url"] = api_url or cfg["api_url"]
-    cfg["model"] = model or cfg["model"]
+    cfg["api_url"] = api_url or os.environ.get("QA_LLM_API_URL") or ""
+    cfg["model"] = model or os.environ.get("QA_LLM_MODEL") or ""
+    cfg["key_env"] = key_env or ""
+    missing = [flag for flag, value in (("--key-env", cfg["key_env"]), ("--api-url or QA_LLM_API_URL", cfg["api_url"]),
+                                        ("--model or QA_LLM_MODEL", cfg["model"])) if not value]
+    if missing:
+        raise SystemExit(OPT_IN_HINT + " Missing: " + ", ".join(missing) + ".")
     limit = cfg["max_tokens"]
     cfg["max_tokens"] = min(max_tokens or limit or 16000, limit) if limit else (max_tokens or 16000)
     return cfg
@@ -252,9 +268,9 @@ RACES = []        # [{"name", "setup", "n", "check"}]
 - Fields with a uniqueness constraint (a unique name, title, email, username, slug or key) get a fresh value on every create call: generate each one with a counter or timestamp helper in setup() and in scenarios, never one fixed literal reused for repeated creates.
 """
 
-# Prompt version 3 = SYSTEM + this block. Added 2026-10-22 for the DVRA blind experiment. Every line is either (a) documentation of the
-# engine interface that the template left out, or (b) a lesson from the VAmPI arms (the "train" target). Nothing here comes from the
-# DVRA ground truth. Versions: 1 = original (VAmPI arms A and B), 2 = SYSTEM as committed in 99e9604 (arm C), 3 = SYSTEM + EXTRA_V3.
+# Prompt version 3 = SYSTEM + this block. Added 2026-10-22 for an internal blind experiment. Every line is either (a) documentation of the
+# engine interface that the template left out, or (b) a lesson from an earlier spec-writing trial. Nothing here comes from the
+# held-out ground truth. Versions: 1 = original, 2 = SYSTEM as first committed, 3 = SYSTEM + EXTRA_V3.
 EXTRA_V3 = r"""
 
 ## Interface details (read carefully, the file is executed by the engines as-is)
@@ -274,7 +290,28 @@ EXTRA_V3 = r"""
 - Create your own throwaway users and resources for anything that modifies or deletes data. Never send shell metacharacters, destructive payloads or requests to non-local hosts.
 """
 SYSTEM_V3 = SYSTEM + EXTRA_V3
-PROMPTS = {2: SYSTEM, 3: SYSTEM_V3}
+
+# Prompt version 4 = SYSTEM_V3 + this block (2026-10-29, after the Immich blind round). Versions 2 and 3 are unchanged, so their
+# frozen hashes (checked in toolkit/test_synthesize_provider.py) still hold. Lessons: an /admin endpoint the writer
+# SKIPped because its guard looked weak was never probed (calendar-heatmap), and a partner-style share was reported as BOLA.
+EXTRA_V4 = r"""
+
+## Flag, do not skip
+- Never put an endpoint in SKIP because its guard looks weaker than its path suggests (for example a path under /admin that a
+  regular user may plausibly reach). Leave it probed. The authz engine treats every /admin path as admin-only and reports a
+  non-admin 2xx as PRIV-ESC, so the guard is tested, not assumed.
+- Mark each such endpoint with a comment line `# FLAG: METHOD /path: <what looks weaker and why>` next to the sets, so the
+  reviewer can confirm the intended audience. A FLAG is a question for the reviewer, not a verdict.
+- SKIP is for endpoints that would damage data, end sessions or call external systems. Give the reason next to each entry.
+
+## Sharing
+- If the source implements sharing between users (partners, members, shared links), declare it as READ access in
+  GRANTS = {"/collection": {"owner_role": ["viewer_role"]}} and cite the source line in a comment.
+- Declare a GRANTS entry only for sharing the source actually implements. Never declare one to make a finding go away.
+  anon is never a viewer: use PUBLIC for open endpoints.
+"""
+SYSTEM_V4 = SYSTEM_V3 + EXTRA_V4
+PROMPTS = {2: SYSTEM, 3: SYSTEM_V3, 4: SYSTEM_V4}
 
 
 def build_user_prompt(parsed, source, openapi_path, base_url):
@@ -415,11 +452,34 @@ def clean_output(text):
     return text
 
 
+# A generated spec is imported and run on the QA machine (run.py loads it with exec_module), so a model reply that imports or calls
+# these must not be written. This is a screen for the obvious spellings, not a sandbox: `getattr(__builtins__, ...)` is not caught.
+FORBIDDEN_MODULES = {"os", "subprocess", "shutil", "pty", "ctypes", "socket"}
+FORBIDDEN_CALLS = {"eval", "exec", "__import__", "compile"}
+
+
+def forbidden_use(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in FORBIDDEN_MODULES:
+                    return f"import {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in FORBIDDEN_MODULES:
+                return f"from {node.module} import ..."
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
+            return f"call to {node.func.id}()"
+    return None
+
+
 def validate(code):
     try:
-        compile(code, "<synthesized>", "exec")
+        tree = ast.parse(code, "<synthesized>")
     except SyntaxError as e:
         return f"SyntaxError line {e.lineno}: {e.msg}"
+    bad = forbidden_use(tree)
+    if bad:
+        return f"FORBIDDEN {bad}: a generated spec runs on the QA machine and may not use it"
     for sym in ("setup", "PUBLIC"):
         if sym not in code:
             return f"missing required symbol: {sym}"
@@ -437,16 +497,20 @@ def main():
     p.add_argument("--source", help="source code dir (optional)")
     p.add_argument("--out", default="qa-spec.py")
     p.add_argument("--base-url", default="http://127.0.0.1:5000")
-    p.add_argument("--provider", choices=sorted(PROVIDERS), default="gemini",
-                   help="preset for url / model / key variable / limits (skycodein: 2048 output tokens, 7500-character prompt)")
-    p.add_argument("--model", default=None, help="overrides the provider's default model")
-    p.add_argument("--api-url", default=None, help="OpenAI-compatible chat completions URL (overrides the provider's)")
+    p.add_argument("--provider", choices=sorted(PROVIDERS), default=None,
+                   help="REQUIRED to opt in (no default). Sets the limits (skycodein: 2048 output tokens, 7500-character prompt)")
+    p.add_argument("--key-env", default=None,
+                   help="REQUIRED to opt in: name of the environment variable holding the API key (e.g. MY_LLM_KEY)")
+    p.add_argument("--model", default=None, help="REQUIRED to opt in unless QA_LLM_MODEL is set")
+    p.add_argument("--api-url", default=None,
+                   help="REQUIRED to opt in unless QA_LLM_API_URL is set: OpenAI-compatible chat completions URL")
     p.add_argument("--max-tokens", type=int, default=16000,
                    help="output limit per call; thinking tokens count against it, so keep it high")
     p.add_argument("--reasoning-effort", choices=["none", "low", "medium", "high"], default="none",
                    help="Gemini thinking budget; 'none' keeps thinking tokens from eating max-tokens")
     p.add_argument("--prompt-version", type=int, choices=sorted(PROMPTS), default=2,
-                   help="system prompt: 2 = committed SYSTEM (default, arm C), 3 = SYSTEM + interface/quality block (DVRA blind experiment)")
+                   help="system prompt: 2 = committed SYSTEM (default, arm C), 3 = SYSTEM + interface/quality block (internal blind experiment), "
+                        "4 = 3 + flag-not-skip and GRANTS rules (2026-10-29)")
     a = p.parse_args()
 
     env_file = Path(__file__).resolve().parent.parent / ".env"
@@ -457,11 +521,11 @@ def main():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-    cfg = provider_settings(a.provider, a.api_url, a.model, a.max_tokens)
+    cfg = provider_settings(a.provider, a.api_url, a.model, a.max_tokens, a.key_env)     # refuses before any network use
     a.api_url, a.model, a.max_tokens = cfg["api_url"], cfg["model"], cfg["max_tokens"]
     api_key = os.environ.get(cfg["key_env"])
     if not api_key:
-        raise SystemExit(f"Set {cfg['key_env']} in the .env file (root of the repository)")
+        raise SystemExit(f"Set {cfg['key_env']} in the environment or the .env file (root of qa-testing); --key-env names it")
 
     parsed_url = urlparse(a.api_url)
     if parsed_url.scheme == "http" and parsed_url.hostname not in ("127.0.0.1", "localhost", "::1"):
@@ -484,6 +548,9 @@ def main():
     code = clean_output(code)
 
     err = validate(code)
+    if err and err.startswith("FORBIDDEN"):
+        print(f"REFUSED: {err}. Nothing written.", file=sys.stderr)
+        sys.exit(3)
     if err:
         print(f"WARNING: {err}", file=sys.stderr)
         print("Writing anyway — may need manual fixes.", file=sys.stderr)

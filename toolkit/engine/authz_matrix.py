@@ -14,6 +14,10 @@ Spec (qa-spec.py) knobs, all optional:
   SKIP        {"POST /auth/logout"}     endpoints never probed
   OWNED_IDS   {"/rest/basket": {"user_a": 3}}   ids that do not come from a POST creator (login response, seed data):
               collection path -> {owner role: id}; attackers are probed against that id
+  GRANTS      {"/assets": {"user_a": ["user_b"]}}   READ shares the app implements (partners, members, shared links):
+              collection path -> {owner role: [viewer roles]}. A viewer listed here may GET the owner's resources in that
+              collection without a finding. Only GET is excused; writes by the same viewer are still reported. anon can never
+              be a granted viewer (use PUBLIC). Every excused 2xx is listed in the result's "excused" (not a finding, not hidden).
 """
 import re
 
@@ -49,37 +53,49 @@ def _compare_with_owner(api, owner, child, path, resp, own=None):
     return "medium", " - 2xx but the body differs from the owner's: verify it is not a generic or filtered answer"
 
 
-def _write_readback(api, owner, child, path, write_body, write_resp):
-    """After an attacker got 2xx on a write: did the write stick? -> (kind, severity, detail_suffix) or None.
+def _read_state(api, owner, child, path):
+    """The owner's view of the resource a write targets: GET of the path, or of the parent when a sub-action path is not GET-able."""
+    state = api.call(owner, "GET", path)
+    parent = path.rsplit("/", 1)[0]
+    if child["method"] != "DELETE" and state.status in (404, 405) and parent not in ("", "/"):
+        # sub-action paths such as /orders/5/status are often not GET-able; the parent resource shows the field
+        parent_state = api.call(owner, "GET", parent)
+        if parent_state.ok:
+            state = parent_state
+    return state
 
-    Confirmed when a GET (same path) as the owner shows the attacker's body fields, or the resource is gone after DELETE.
-    If there is no GET sibling or the GET is inconclusive -> UNKNOWN-AUTH (medium): the 2xx alone is not proven access.
+
+def _note_once(notes, text):
+    if text not in notes:
+        notes.append(text)
+
+
+def _write_readback(api, owner, child, path, write_body, write_resp, before=None):
+    """After an attacker got 2xx on a write: was a change proven? -> (kind, severity, detail_suffix) or None.
+
+    A write is reported only when the owner's read-back shows a value that CHANGED between `before` (the owner's view taken just
+    before the attacker's write) and now, and that value is the one the attacker sent. A no-op write (the values were already there),
+    an effect that cannot be read back, or a DELETE whose resource still exists -> None: the caller records a note, not a finding.
     """
     if child["method"] not in WRITE_METHODS or not write_resp.ok:
         return None
-    get_path = path
-    after = api.call(owner, "GET", get_path)
-    parent = get_path.rsplit("/", 1)[0]
-    if child["method"] != "DELETE" and after.status in (404, 405) and parent not in ("", "/"):
-        # sub-action paths such as /orders/5/status are often not GET-able; the parent resource shows the field
-        parent_after = api.call(owner, "GET", parent)
-        if parent_after.ok:
-            after = parent_after
+    after = _read_state(api, owner, child, path)
     if child["method"] == "DELETE":
-        if after.status in (404, 410):
+        if after.status in (404, 410) and before is not None and before.ok:
             return ("BOLA/IDOR", "high", " - read-back: owner GET is gone after attacker DELETE (write stuck)")
-        return ("UNKNOWN-AUTH", "medium",
-                f" - attacker DELETE got {write_resp.status} but owner GET still {after.status}: write effect unconfirmed")
-    if not after.ok:
-        return ("UNKNOWN-AUTH", "medium",
-                f" - attacker write got {write_resp.status} but owner cannot re-read ({after.status}): effect unconfirmed")
-    if write_body and isinstance(write_body, dict) and isinstance(after.json, dict):
-        matched = [k for k, v in write_body.items() if k in after.json and after.json.get(k) == v]
-        if matched:
-            return ("BOLA/IDOR", "high",
-                    f" - read-back: owner GET reflects attacker's write fields {matched}")
-    return ("UNKNOWN-AUTH", "medium",
-            " - attacker write got 2xx; read-back did not prove the change stuck (verify manually)")
+        return None
+    if not after.ok or not isinstance(after.json, dict):
+        return None
+    if not (write_body and isinstance(write_body, dict)):
+        return None
+    before_json = before.json if before is not None and before.ok and isinstance(before.json, dict) else None
+    if before_json is None:
+        return None                                    # no 'before' view: a value that is there now cannot be shown to be the attacker's change
+    changed = [k for k, v in write_body.items()
+               if k in after.json and after.json.get(k) == v and before_json.get(k) != after.json.get(k)]
+    if changed:
+        return ("BOLA/IDOR", "high", f" - read-back: owner GET changed to the attacker's write fields {changed}")
+    return None
 
 
 MEMBER_RE = re.compile(r"member|collaborator|participant|share|invite", re.I)
@@ -143,6 +159,34 @@ def _member_write(api, eps, spec_doc, qa, owner, rid, collection, skip, add, not
                 + (": the operation says owners/admins only" if documented else "; the document does not say who may change it, confirm the role matrix"))
 
 
+def _grants(qa, notes) -> dict:
+    """GRANTS -> {(collection, owner role): {viewer roles}}. A malformed entry, or one naming anon, is dropped with a note
+    (the run is then DEGRADED, so the dropped grant is visible rather than silently ignored)."""
+    out = {}
+    for coll, owners in (getattr(qa, "GRANTS", None) or {}).items():
+        if not isinstance(owners, dict):
+            notes.append(f"GRANTS['{coll}'] is not a {{owner: [viewers]}} dict: ignored")
+            continue
+        for owner, viewers in owners.items():
+            if not isinstance(viewers, (list, tuple, set)) or not all(isinstance(v, str) for v in viewers) or "anon" in viewers:
+                notes.append(f"GRANTS['{coll}']['{owner}'] must be a list of viewer role names and cannot name anon: ignored")
+                continue
+            out.setdefault((coll.rstrip("/"), owner), set()).update(viewers)
+    return out
+
+
+def _excused(grants, coll, owner, attacker, method) -> bool:
+    """True when the app shares this owner's collection with this attacker and the probe is a READ."""
+    return method == "GET" and attacker in grants.get((coll, owner), ())
+
+
+def _priv_detail(k, declared_admin) -> str:
+    """A path-prefix-only admin endpoint (not declared in ADMIN_ONLY) is treated as admin by the engine: say so in the finding."""
+    if k in declared_admin:
+        return ""
+    return " (admin only by the /admin path prefix; ADMIN_ONLY does not declare it: confirm the intended audience)"
+
+
 def _body(ep, qa, spec_doc):
     custom = getattr(qa, "BODIES", {}).get(key(ep))
     if custom is not None:
@@ -154,7 +198,8 @@ def _body(ep, qa, spec_doc):
 
 def inferred_public(spec_doc: dict, eps: list) -> set:
     """Operations the OpenAPI document itself declares as needing no credentials: an explicit empty `security: []` on the operation,
-    or inherited from an explicit empty global `security: []`. Only trusted when the document really describes security somewhere
+    or inherited from an explicit empty global `security: []`, or a requirement list with an empty alternative `{}` (optional auth,
+    e.g. `security: [{}, {"bearer": []}]`: anonymous access is one of the allowed alternatives). Only trusted when the document really describes security somewhere
     (a global requirement or an operation with a requirement); a spec that never mentions security says nothing about who may call what,
     so nothing is inferred and every anonymous 2xx is still reported."""
     glob = spec_doc.get("security")
@@ -165,7 +210,7 @@ def inferred_public(spec_doc: dict, eps: list) -> set:
     out = set()
     for e, o in ops:
         effective = o.get("security") if isinstance(o, dict) and "security" in o else glob
-        if effective is not None and len(effective) == 0:
+        if effective is not None and (len(effective) == 0 or any(isinstance(alt, dict) and not alt for alt in effective)):
             out.add(key(e))
     return out
 
@@ -178,8 +223,13 @@ def run(api, spec_doc, qa) -> dict:
     skip = set(getattr(qa, "SKIP", set()))
     admin_only = set(getattr(qa, "ADMIN_ONLY", set())) | {key(e) for e in eps if "/admin" in e["path"]}
     owner_map = getattr(qa, "OWNER", {})
+    declared_admin = set(getattr(qa, "ADMIN_ONLY", set()))
     findings, notes, setup_failed, probes = [], [], [], 0
-    probed: set[str] = set()      # id-endpoints already attacked through a creator
+    grants = _grants(qa, notes)
+    excused = []                  # READ probes a declared GRANTS entry explains: listed, not findings
+    probed: set[str] = set()      # id-endpoints actually attacked (through a creator, OWNED_IDS, or the admin-only probe)
+    admin_noted: set[str] = set() # admin-only id-endpoints already noted (IDS missing): not noted a second time as unprobed
+    setup_blocked: set[str] = set() # collections whose creator failed (conflict / no sample): already reported by notes or setup_failed
 
     def add(kind, severity, ep, role, resp, detail):
         findings.append({"kind": kind, "severity": severity, "endpoint": key(ep), "role": role,
@@ -203,16 +253,19 @@ def run(api, spec_doc, qa) -> dict:
             if is_repeat_write_conflict(r):
                 setup_failed.append(f"{key(creator)}: repeated create as {owner} hit a uniqueness conflict (status {r.status}); "
                                     f"the probes behind it did not run. Give the unique field a fresh value per create")
+                setup_blocked.add(collection)
             return extract_id(r.json) if r.ok else None
 
         first = api.call(owner, "POST", creator["path"], body)
         if is_repeat_write_conflict(first):
             setup_failed.append(f"{key(creator)}: first create as {owner} hit a uniqueness conflict (status {first.status}); "
                                 f"the probes behind it did not run")
+            setup_blocked.add(collection)
             continue
         if not first.ok or extract_id(first.json) is None:
             notes.append(f"{key(creator)}: could not create sample as {owner} (status {first.status}); "
                          f"add BODIES['{key(creator)}'] to qa-spec.py")
+            setup_blocked.add(collection)
             continue
         try:
             _member_write(api, eps, spec_doc, qa, owner, extract_id(first.json), collection, skip, add, notes)
@@ -223,8 +276,8 @@ def run(api, spec_doc, qa) -> dict:
                 api.call(attacker, "POST", creator["path"], body)
         for child in children:
             for attacker in ATTACKERS:
-                if attacker not in api.roles or key(child) in public:
-                    continue
+                if attacker not in api.roles or attacker == owner or key(child) in public:
+                    continue                  # the owner reading its own resource is not an access finding
                 rid = make()
                 if rid is None:
                     break
@@ -232,19 +285,25 @@ def run(api, spec_doc, qa) -> dict:
                 probed.add(key(child))
                 path = fill(child["path"], {child["path_params"][0]: rid})
                 wbody = _body(child, qa, spec_doc)
+                before = _read_state(api, owner, child, path) if child["method"] in WRITE_METHODS else None
                 resp = api.call(attacker, child["method"], path, wbody)
+                if resp.ok and _excused(grants, collection, owner, attacker, child["method"]):
+                    excused.append({"endpoint": key(child), "role": attacker, "owner": owner, "status": resp.status,
+                                    "why": "declared in GRANTS: the owner shares this collection with this viewer (read only)"})
+                    continue
                 if resp.ok:
                     if child["method"] in WRITE_METHODS:
-                        rb = _write_readback(api, owner, child, path, wbody, resp)
-                        if rb:
-                            kind, sev, ev_text = rb
+                        rb = _write_readback(api, owner, child, path, wbody, resp, before)
+                        if rb or attacker == "anon":
+                            # anon has no legitimate access at all, so any 2xx on a write is the finding; the read-back only adds proof
+                            kind, sev, ev_text = rb or ("MISSING-AUTH", "high", " - no change visible in the read-back, but the anonymous write was accepted")
                             if attacker == "anon" and kind == "BOLA/IDOR":
                                 kind = "MISSING-AUTH"
                             add(kind, sev, child, attacker, resp,
                                 f"{attacker} got {resp.status} on {child['method']} {path}, resource created by {owner}{ev_text}")
                         else:
-                            add("BOLA/IDOR" if attacker != "anon" else "MISSING-AUTH", "high", child, attacker, resp,
-                                f"{attacker} got {resp.status} on {child['method']} {path}, resource created by {owner}")
+                            _note_once(notes, f"{key(child)}: {attacker}'s {child['method']} got {resp.status} but the owner's read-back shows no "
+                                              "changed value set by the attacker (no-op, or effect not readable): not reported as an access finding")
                     else:
                         kind = "BOLA/IDOR" if attacker != "anon" else "MISSING-AUTH"
                         sev = "medium" if attacker != "anon" else "high"
@@ -274,19 +333,24 @@ def run(api, spec_doc, qa) -> dict:
                     probes += 1
                     probed.add(key(child))
                     wbody = body if child["method"] in WRITE_METHODS else None
+                    before = _read_state(api, owner, child, path) if child["method"] in WRITE_METHODS else None
                     resp = api.call(attacker, child["method"], path, wbody)
+                    if resp.ok and _excused(grants, coll.rstrip("/"), owner, attacker, child["method"]):
+                        excused.append({"endpoint": key(child), "role": attacker, "owner": owner, "status": resp.status,
+                                        "why": "declared in GRANTS: the owner shares this collection with this viewer (read only)"})
+                        continue
                     if resp.ok:
                         if child["method"] in WRITE_METHODS:
-                            rb = _write_readback(api, owner, child, path, wbody, resp)
-                            if rb:
-                                kind, sev, ev_text = rb
+                            rb = _write_readback(api, owner, child, path, wbody, resp, before)
+                            if rb or attacker == "anon":
+                                kind, sev, ev_text = rb or ("MISSING-AUTH", "high", " - no change visible in the read-back, but the anonymous write was accepted")
                                 if attacker == "anon" and kind == "BOLA/IDOR":
                                     kind = "MISSING-AUTH"
                                 add(kind, sev, child, attacker, resp,
                                     f"{attacker} got {resp.status} on {child['method']} {path}, resource belongs to {owner} (OWNED_IDS){ev_text}")
                             else:
-                                add("BOLA/IDOR" if attacker != "anon" else "MISSING-AUTH", "high", child, attacker, resp,
-                                    f"{attacker} got {resp.status} on {child['method']} {path}, resource belongs to {owner} (OWNED_IDS)")
+                                _note_once(notes, f"{key(child)}: {attacker}'s {child['method']} got {resp.status} but the owner's read-back shows no "
+                                                  "changed value set by the attacker (no-op, or effect not readable): not reported as an access finding")
                         else:
                             kind = "BOLA/IDOR" if attacker != "anon" else "MISSING-AUTH"
                             ev_sev, ev_text = _compare_with_owner(api, owner, child, path, resp, own if child["method"] == "GET" else None)
@@ -298,17 +362,22 @@ def run(api, spec_doc, qa) -> dict:
 
     # admin-only endpoints that take an id (e.g. PATCH /users/{user_id}/role): need IDS = {"user_id": <a harmless id>}
     ids = getattr(qa, "IDS", {})
+    admin_role = getattr(qa, "ADMIN_ROLE", "admin")
+    plain_roles = [r for r in api.roles if r not in ("anon", admin_role)]     # every non-admin role, whichever role created the resource
     for ep in eps:
         k = key(ep)
-        if k in skip or k in probed or not ep["path_params"] or k not in admin_only or "user_a" not in api.roles:
+        if k in skip or not ep["path_params"] or k not in admin_only or not plain_roles:
             continue
         if not all(p in ids for p in ep["path_params"]):
-            notes.append(f"{k}: admin-only but IDS lacks {ep['path_params']} in qa-spec.py, not probed")
+            _note_once(notes, f"{k}: admin-only but IDS lacks {ep['path_params']} in qa-spec.py, not probed")
+            admin_noted.add(k)
             continue
-        probes += 1
-        resp = api.call("user_a", ep["method"], fill(ep["path"], ids), _body(ep, qa, spec_doc))
-        if resp.ok:
-            add("PRIV-ESC", "high", ep, "user_a", resp, f"plain user got {resp.status} on admin-only endpoint")
+        for role in plain_roles:
+            probes += 1
+            probed.add(k)
+            resp = api.call(role, ep["method"], fill(ep["path"], ids), _body(ep, qa, spec_doc))
+            if resp.ok:
+                add("PRIV-ESC", "high", ep, role, resp, f"plain user ({role}) got {resp.status} on admin-only endpoint" + _priv_detail(k, declared_admin))
 
     # function-level checks on endpoints without a resource id
     for ep in eps:
@@ -329,9 +398,24 @@ def run(api, spec_doc, qa) -> dict:
             probes += 1
             resp = api.call("user_a", ep["method"], fill(ep["path"], {}), body)
             if resp.ok:
-                add("PRIV-ESC", "high", ep, "user_a", resp, f"plain user got {resp.status} on admin-only endpoint")
+                add("PRIV-ESC", "high", ep, "user_a", resp, f"plain user got {resp.status} on admin-only endpoint" + _priv_detail(k, declared_admin))
+
+    # id-routes the run could not attack at all (no POST creator for their collection, no OWNED_IDS entry, or several path params):
+    # MISSING-AUTH and PRIV-ESC were never tested for them. Say so: a note, which makes the run DEGRADED, never a silent ran_ok
+    for ep in eps:
+        k = key(ep)
+        if k in skip or k in public or k in probed or k in admin_noted or not ep["path_params"]:
+            continue
+        if len(ep["path_params"]) == 1 and prefix_of(ep["path"], ep["path_params"][0]) in setup_blocked:
+            continue                                    # its creator failed: reported already, as a setup failure or a note
+        if len(ep["path_params"]) == 1:
+            hint = "no POST creator for its collection and no OWNED_IDS entry: add OWNED_IDS in qa-spec.py to test it"
+        else:
+            hint = "several path params: this engine does not attack nested id routes yet (not a pass)"
+        _note_once(notes, f"{k}: not probed for MISSING-AUTH or PRIV-ESC: {hint}")
     res = {"engine": "authz", "probes": probes, "findings": findings, "notes": notes + setup_failed, "setup_failed": setup_failed,
-           "inferred_public": sorted(inferred)}          # not in `notes`: inferring from the document is not a limitation of the run
+           "inferred_public": sorted(inferred),          # not in `notes`: inferring from the document is not a limitation of the run
+           "excused": excused}
     if notes:
         extra = f" (+{len(setup_failed)} setup failure(s))" if setup_failed else ""
         return trust.mark(res, trust.DEGRADED, f"{len(notes)} probe group(s) skipped or limited{extra}: " + notes[0][:140])

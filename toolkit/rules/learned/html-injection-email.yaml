@@ -8,4 +8,4 @@ rules:
     patterns:
       - pattern: $F(..., html=f"...", ...)
       - pattern-regex: 'html=\(?\s*f"[^"\n]*\{(?!\s*(html_lib|html|markupsafe)\.escape\(|\s*escape\(|[^}]*:\.?\d*[fd]\})'
-    metadata: {class: html-injection-email, learned_from: "private QA run seed S10 2026-10-16"}
+    metadata: {class: html-injection-email, learned_from: "internal testing seed S10 2026-10-16"}

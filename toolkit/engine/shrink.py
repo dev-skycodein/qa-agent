@@ -324,6 +324,7 @@ class Replayer:
         self.roles = roles or {}
         self.ctx_factory = ctx_factory
         self.trials = 0
+        self.last_seed_log: list = []     # the requests ctx_factory (fresh_state) made in the last trial: the PoC must replay them
 
     def run(self, steps, detector) -> dict:
         """outcome: 'fail' (sig = the first failure's signature), 'pass', or 'invalid' (a reference could not resolve)."""
@@ -332,6 +333,7 @@ class Replayer:
             self.reset()
         api = Api(self.base_url, roles=self.roles)
         ctx = self.ctx_factory(api) if self.ctx_factory else {}
+        self.last_seed_log = list(api.log)
         ids: dict = {}
         for n, s in enumerate(steps):
             try:
@@ -430,8 +432,32 @@ def steps_from_log(entries):
     cut = next((i for i, e in enumerate(entries) if e["status"] >= 500), None)
     if cut is None:
         raise ValueError("no 5xx / no-HTTP-answer entry in the log: nothing to shrink")
+    return _entries_to_steps(entries[: cut + 1])
+
+
+def _with_seed(seed_steps, steps):
+    """The PoC's step list: the fresh_state seed requests first, then the shrunk steps with their {{step_N.id}} references
+    moved past the seed (the seed's own steps keep idx 0..m-1)."""
+    m = len(seed_steps)
+    if not m:
+        return list(steps)
+
+    def shift(value):
+        if isinstance(value, str):
+            return PLACEHOLDER_RE.sub(lambda mt: "{{step_%d.id}}" % (int(mt.group(1)) + m), value)
+        if isinstance(value, dict):
+            return {k: shift(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [shift(v) for v in value]
+        return value
+
+    return list(seed_steps) + [{**s, "idx": s["idx"] + m, "path": shift(s["path"]), "body": shift(s.get("body"))} for s in steps]
+
+
+def _entries_to_steps(entries):
+    """api.log entries -> steps (no cut). Shared by steps_from_log and the seed replay."""
     steps, ids_by_value = [], {}
-    for i, e in enumerate(entries[: cut + 1]):
+    for i, e in enumerate(entries):
         if e.get("request") == "<raw>":
             raise ValueError(f"step {i} sent a raw body: it cannot be replayed")
         segs = e["path"].split("?", 1)[0].split("/")
@@ -477,12 +503,15 @@ PLACEHOLDER = re.compile(r"\\{\\{step_(\\d+)\\.id\\}\\}")
 ID_SEG = re.compile(r"^(\\d+|[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}|\\{\\{step_\\d+\\.id\\}\\})$")
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
+class _LocalRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to a local host, as the replayer does; any other redirect comes back as the 3xx."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        if urllib.parse.urlparse(newurl).hostname not in LOCAL_HOSTS:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LocalRedirect)
 
 
 def norm_path(path):
@@ -658,6 +687,14 @@ def shrink_finding(steps, base_url, detector, reset=None, roles=None, ctx_factor
                               "a truncated tail misses setup steps, or the bug is not deterministic")
         target = first["sig"]
         result.update(signature=target, kind=kind_of(target), trials=1)
+        seed_steps = []
+        if ctx_factory is not None:
+            try:
+                seed_steps = _entries_to_steps(rep.last_seed_log)
+            except ValueError as exc:
+                notes.append(f"fresh_state() requests cannot be replayed in the PoC ({exc})")
+            if not seed_steps and not notes:
+                notes.append("fresh_state() made no logged request: the PoC has no seed steps (it may not run on the app's own client)")
         if expected_sig and expected_sig != target:
             return trust.mark(result, trust.SETUP_FAILED,
                               f"the original failed with a different signature: got {target}, expected {expected_sig}")
@@ -683,6 +720,7 @@ def shrink_finding(steps, base_url, detector, reset=None, roles=None, ctx_factor
         result["flaky"] = 0 < k < runs
 
         m = len(final)
+        poc_steps = _with_seed(seed_steps, final)
         if k == 0:
             status, reason = trust.SETUP_FAILED, (f"the minimal sequence did not reproduce in {runs} re-runs (the oracle "
                                                   "run was a fluke or the bug is flaky): no PoC written")
@@ -699,8 +737,9 @@ def shrink_finding(steps, base_url, detector, reset=None, roles=None, ctx_factor
             if status == trust.RAN_OK:                          # no reset(): the repro is not on fresh state, so not confirmed
                 status = trust.DEGRADED
         trust.mark(result, status, reason)                      # status first: write_poc quotes it in the .md
+        result["poc_steps"] = poc_steps
         if k >= 1 and out_dir is not None:
-            result["poc_path"], result["poc_md_path"] = write_poc(out_dir, final, target, detector, result)
+            result["poc_path"], result["poc_md_path"] = write_poc(out_dir, poc_steps, target, detector, result)
         return result
     except Exception as exc:                                    # reset / app / detector crash: never a fake result
         return trust.mark(result, trust.ERRORED, f"{type(exc).__name__}: {str(exc)[:200]}")

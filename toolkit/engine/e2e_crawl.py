@@ -16,6 +16,10 @@ Forms: filled with sample values and submitted with a double click: more than on
 Limit (safety): the crawl only enqueues same-host links and aborts navigation when the final URL leaves the base
 host:port (cookies stay scoped by Playwright, but a 302 off-machine is still a second HTTP client). Off-machine
 final URLs are recorded as E2E-OFFHOST findings and not followed further.
+The --base-url must be an http(s) URL on a loopback host, or the crawl refuses to start (api.assert_local).
+NOT covered: the browser itself is launched without a proxy and without request routing. A page's own third-party
+scripts, images, beacons, and a form whose action points off-host are still fetched by the browser (a form double-click
+submits to that host). Only the navigation target is checked. Do not read this crawl as "no outside traffic".
 """
 import argparse
 import importlib.util

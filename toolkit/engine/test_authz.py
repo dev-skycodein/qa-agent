@@ -181,9 +181,10 @@ class SubresourceApi:
 
 def test_write_readback_on_subaction_path_uses_parent_resource():
     api = SubresourceApi()
+    before = authz_matrix._read_state(api, "user_a", {"method": "PATCH"}, "/orders/5/status")   # owner's view before the attacker writes
     written = api.call("user_b", "PATCH", "/orders/5/status", {"status": "shipped"})
     kind, sev, detail = authz_matrix._write_readback(
-        api, "user_a", {"method": "PATCH"}, "/orders/5/status", {"status": "shipped"}, written)
+        api, "user_a", {"method": "PATCH"}, "/orders/5/status", {"status": "shipped"}, written, before)
     assert (kind, sev) == ("BOLA/IDOR", "high") and "read-back" in detail, (kind, sev, detail)
 
 
@@ -191,13 +192,17 @@ def test_delete_readback_does_not_fall_back_to_parent():
     class GoneApi(SubresourceApi):
         def call(self, role, method, path, body=None, query=None, raw=None, headers=None):
             return api_mod.Resp(404, "{}") if method == "GET" else api_mod.Resp(200, "{}")
-    kind, sev, _ = authz_matrix._write_readback(GoneApi(), "user_a", {"method": "DELETE"}, "/orders/5", None, api_mod.Resp(200, "{}"))
+    before = api_mod.Resp(200, '{"id": 5}')                                                 # owner saw the order before the DELETE
+    kind, sev, _ = authz_matrix._write_readback(GoneApi(), "user_a", {"method": "DELETE"}, "/orders/5", None, api_mod.Resp(200, "{}"), before)
     assert (kind, sev) == ("BOLA/IDOR", "high"), kind
 
 
-def test_write_2xx_without_visible_effect_is_unknown_auth():
-    f = [x for x in _run("write_ok_no_effect")["findings"] if x["endpoint"].startswith("PATCH ")]
-    assert f and all(x["kind"] == "UNKNOWN-AUTH" and x["severity"] == "medium" for x in f), f
+def test_write_2xx_without_visible_effect_by_user_is_noted_anon_is_missing_auth():
+    # policy: a logged-in attacker's 2xx write with no visible effect is a note (run DEGRADED); anon's 2xx write is MISSING-AUTH
+    r = _run("write_ok_no_effect")
+    patch = [x for x in r["findings"] if x["endpoint"].startswith("PATCH ")]
+    assert patch and all(x["role"] == "anon" and x["kind"] == "MISSING-AUTH" for x in patch), patch
+    assert r["status"] == "degraded" and any("no-op" in n for n in r["notes"]), (r["status"], r["notes"])
 
 
 def _eps(doc):
@@ -340,6 +345,112 @@ def test_member_write_is_medium_when_the_operation_says_owner_only():
 def test_owner_only_update_has_no_member_write_finding():
     r = authz_matrix.run(MemberApi("owner_only"), MEMBER_SPEC, SimpleNamespace())
     assert [f for f in r["findings"] if f["kind"] == "AUTHZ-MEMBER-WRITE"] == [], r["findings"]
+
+
+# ---- GRANTS: a declared READ share is not a violation; everything undeclared is still reported ----
+
+GRANT_SPEC = {"paths": {
+    "/orders": {"post": {"requestBody": {"content": {"application/json": {"schema": {
+        "type": "object", "properties": {"qty": {"type": "integer"}}, "required": ["qty"]}}}}}},
+    "/orders/{order_id}": {"get": {"summary": "read"}, "patch": {"requestBody": {"content": {"application/json": {"schema": {
+        "type": "object", "properties": {"status": {"type": "string"}}}}}}}},
+}}
+
+
+def _granted_run(mode, grants):
+    qa = SimpleNamespace(PUBLIC={"POST /orders"}, GRANTS=grants)
+    return authz_matrix.run(FakeApi(mode), GRANT_SPEC, qa)
+
+
+def test_declared_grant_excuses_partner_read_and_lists_it():
+    """The Immich shape: user_b (a partner) reads user_a's order. Declared in GRANTS -> no finding, but listed as excused."""
+    res = _granted_run("leak", {"/orders": {"user_a": ["user_b"]}})
+    assert [f for f in res["findings"] if f["endpoint"].startswith("GET ") and f["role"] == "user_b"] == [], res["findings"]
+    assert any(e["endpoint"] == "GET /orders/{order_id}" and e["role"] == "user_b" and e["owner"] == "user_a"
+               for e in res["excused"]), res["excused"]
+    assert trust.resolve(res)[0] == trust.RAN_OK, res["notes"]
+
+
+def test_grant_does_not_excuse_a_write_by_the_same_viewer():
+    """A partner may read; a PATCH by the same partner on the owner's order is still a write BOLA and stays high."""
+    res = _granted_run("leak", {"/orders": {"user_a": ["user_b"]}})
+    writes = [f for f in res["findings"] if f["endpoint"] == "PATCH /orders/{order_id}" and f["role"] == "user_b"]
+    assert writes and all(f["severity"] == "high" for f in writes), res["findings"]
+
+
+def test_grant_for_another_owner_does_not_excuse():
+    res = _granted_run("leak", {"/orders": {"user_c": ["user_b"]}})
+    assert any(f["role"] == "user_b" and f["endpoint"].startswith("GET ") for f in res["findings"]), res["findings"]
+    assert res["excused"] == []
+
+
+def test_grant_for_another_collection_does_not_excuse():
+    res = _granted_run("leak", {"/albums": {"user_a": ["user_b"]}})
+    assert any(f["role"] == "user_b" and f["endpoint"].startswith("GET ") for f in res["findings"]), res["findings"]
+    assert res["excused"] == []
+
+
+def test_anon_can_never_be_a_granted_viewer():
+    """anon in GRANTS is refused (use PUBLIC): the anon read is still MISSING-AUTH and the run is DEGRADED with the reason."""
+    res = _granted_run("leak", {"/orders": {"user_a": ["anon"]}})
+    assert any(f["kind"] == "MISSING-AUTH" and f["role"] == "anon" for f in res["findings"]), res["findings"]
+    assert res["excused"] == [] and any("anon" in n for n in res["notes"]), res["notes"]
+    assert trust.resolve(res)[0] == trust.DEGRADED
+
+
+def test_malformed_grants_are_ignored_with_a_note_not_silently():
+    res = _granted_run("leak", {"/orders": {"user_a": "user_b"}})     # a string, not a list
+    assert any("GRANTS['/orders']['user_a']" in n for n in res["notes"]), res["notes"]
+    assert res["excused"] == [] and any(f["role"] == "user_b" for f in res["findings"])
+
+
+def test_no_grants_keeps_the_existing_high_bola():
+    """Undeclared access is still reported exactly as before."""
+    res = _granted_run("leak", None)
+    assert any(f["role"] == "user_b" and f["endpoint"].startswith("GET ") and f["severity"] == "high" for f in res["findings"])
+    assert res["excused"] == []
+
+
+ADMIN_SPEC = {"paths": {"/admin/stats": {"get": {"summary": "stats"}}}}
+
+
+class AdminApi:
+    """GET /admin/stats answers 200 to everyone, including a plain user (a real PRIV-ESC shape)."""
+
+    def __init__(self):
+        self.roles, self.log = {"anon": {}, "user_a": {"t": "a"}}, []
+
+    def call(self, role, method, path, body=None, query=None, raw=None, headers=None):
+        return api_mod.Resp(200, '{"total": 1}')
+
+
+def test_admin_prefix_only_endpoint_says_it_is_admin_by_path_not_by_declaration():
+    res = authz_matrix.run(AdminApi(), ADMIN_SPEC, SimpleNamespace(PUBLIC=set(), ADMIN_ONLY=set()))
+    priv = [f for f in res["findings"] if f["kind"] == "PRIV-ESC"]
+    assert priv and all(f["severity"] == "high" for f in priv), res["findings"]
+    assert all("confirm the intended audience" in f["detail"] for f in priv), priv
+
+
+def test_declared_admin_only_endpoint_has_no_path_prefix_note():
+    res = authz_matrix.run(AdminApi(), ADMIN_SPEC, SimpleNamespace(PUBLIC=set(), ADMIN_ONLY={"GET /admin/stats"}))
+    priv = [f for f in res["findings"] if f["kind"] == "PRIV-ESC"]
+    assert priv and all("confirm the intended audience" not in f["detail"] for f in priv), priv
+
+
+def test_admin_path_with_an_id_is_probed_and_flagged_when_not_skipped():
+    """The Immich calendar-heatmap shape: a /admin path with {id}, answered 200 to a plain user. Not in SKIP -> PRIV-ESC high,
+    with the path-prefix note. (With the id supplied through IDS; without it the engine notes the gap instead.)"""
+    spec = {"paths": {"/admin/users/{id}/calendar-heatmap": {"get": {"summary": "heatmap"}}}}
+    res = authz_matrix.run(AdminApi(), spec, SimpleNamespace(PUBLIC=set(), ADMIN_ONLY=set(), IDS={"id": "7"}))
+    priv = [f for f in res["findings"] if f["kind"] == "PRIV-ESC" and f["endpoint"] == "GET /admin/users/{id}/calendar-heatmap"]
+    assert priv and priv[0]["role"] == "user_a" and "confirm the intended audience" in priv[0]["detail"], res["findings"]
+
+
+def test_admin_path_with_an_id_and_no_ids_entry_is_a_visible_gap_not_silence():
+    spec = {"paths": {"/admin/users/{id}/calendar-heatmap": {"get": {"summary": "heatmap"}}}}
+    res = authz_matrix.run(AdminApi(), spec, SimpleNamespace(PUBLIC=set(), ADMIN_ONLY=set()))
+    assert any("not probed" in n for n in res["notes"]), res["notes"]
+    assert trust.resolve(res)[0] == trust.DEGRADED
 
 
 if __name__ == "__main__":

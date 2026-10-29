@@ -30,8 +30,13 @@ def run(api, spec_doc, qa) -> dict:
     if not races:
         notes.append("no RACES in qa-spec.py (write one per money/stock/uniqueness invariant)")
     for scenario in races:
+        if "setup" not in scenario or "check" not in scenario:    # a spec error must not become a RACE-INVARIANT finding
+            notes.append(f"{scenario['name']}: spec error: a RACES entry needs 'setup' and 'check'; not run")
+            setup_failed += 1
+            continue
         # a race is timing-dependent: one clean burst proves nothing, so retry on fresh state until it breaks
-        for attempt in range(scenario.get("attempts", ATTEMPTS)):
+        # (at least one burst: attempts: 0 would otherwise run nothing and leave `attempt` unbound)
+        for attempt in range(max(1, int(scenario.get("attempts", ATTEMPTS)))):
             ctx = fresh(api) or {}
             try:
                 req = scenario["setup"](api, ctx)
@@ -39,7 +44,12 @@ def run(api, spec_doc, qa) -> dict:
                 notes.append(f"{scenario['name']}: setup failed ({type(exc).__name__}: {exc})")
                 setup_failed += 1
                 break
-            headers = api.roles.get(req.get("role", "user_a"), {})
+            role = req.get("role", "user_a")
+            if role not in api.roles:                              # an unknown role would silently send the burst anonymous
+                notes.append(f"{scenario['name']}: role {role!r} is not a role from setup(): burst not run (it would be anonymous)")
+                setup_failed += 1
+                break
+            headers = api.roles[role]
             results = race(req["method"], api.base + req["path"], n=scenario.get("n", 15),
                            headers=headers, body=req.get("body"), per_request_headers=req.get("per_request_headers"))
             codes = [c for c, _ in results]

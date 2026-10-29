@@ -18,7 +18,8 @@ def _rx(path: str):
 def run(api, spec_doc) -> dict:
     eps = endpoints(spec_doc)
     table = {key(e): defaultdict(lambda: defaultdict(int)) for e in eps}
-    matchers = [(e["method"], _rx(e["path"]), key(e)) for e in eps]
+    # first match wins, so the most literal path must come first: "/orders/export" is not "/orders/{id}"
+    matchers = [(e["method"], _rx(e["path"]), key(e)) for e in sorted(eps, key=lambda e: (e["path"].count("{"), -len(e["path"])))]
     for entry in api.log:
         path = entry["path"].split("?")[0]
         for method, rx, k in matchers:
@@ -43,6 +44,10 @@ def run(api, spec_doc) -> dict:
     if five:
         notes.append("endpoints that returned 5xx during the run: " + "; ".join(five))
     exercised = sum(1 for k in table if any(c.get("2xx") for c in table[k].values()))
-    return {"engine": "coverage", "findings": findings, "notes": notes, "status": trust.RAN_OK, "status_reason": "",
+    status, reason = trust.RAN_OK, ""
+    if never_ok:                       # a blind spot is not "absence of findings is real evidence"
+        status = trust.DEGRADED
+        reason = f"{len(never_ok)} endpoint(s) never answered 2xx: nothing behind them was tested"
+    return {"engine": "coverage", "findings": findings, "notes": notes, "status": status, "status_reason": reason,
             "summary": {"endpoints": len(eps), "answered_2xx": exercised, "requests": len(api.log)},
             "table": {k: {r: dict(c) for r, c in roles.items()} for k, roles in table.items()}}

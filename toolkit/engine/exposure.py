@@ -1,15 +1,19 @@
 """Sensitive-field exposure: secrets that a response should never carry, found by reading the bodies the other engines already got.
 
-No extra requests: it scans `api.log` (every response body the run saw). A finding is a response field whose NAME says credential/secret
-(password, hash, secret, api_key, private_key, invite_code, ...) or whose VALUE looks like one (bcrypt, 64-hex digest, PEM key), on an
-endpoint that is not itself the place a credential is issued (login / token / refresh / session / password reset). The value is never
-printed: only the first 3 characters and the length.
+It scans `api.log` (every response body the run saw), and it ALSO sends one GET per parameterless GET endpoint and configured role
+(`_sweep`), so endpoints no other engine called are inspected too. Those sweep GETs are not verified read-only: a GET can change state on
+the target (a logout, an export, a reset). Exclude such endpoints with `qa.SKIP`; the run notes say how many sweep GETs were sent.
+A finding is a response field whose NAME says credential/secret (password, hash, secret, api_key, private_key, invite_code, ...) or
+whose VALUE looks like one (bcrypt, PEM key, or a 64-hex digest under a secret-looking name), on an endpoint that is not itself the
+place a credential is issued (login / token / refresh / session / password reset). On such an issuing endpoint only a password, hash or
+secret field is reported (a token there is what the endpoint is for). A bare 64-hex value under an innocent name is NOT reported (it is
+usually a content id). The value is never printed: only the first 3 characters and the length.
 
 Design (tree of thoughts): (A) name-only match: cheap, noisy ("token" fields that are legitimately issued); (B) value-only match: misses
 a plain-text secret; (C) name AND issuance-context filter, plus value shapes as a second, independent signal: chosen. False-positive
 risks: a documented field such as `has_password: true` (boolean values are ignored), a public invite code meant to be shared (severity
-medium and 'verify'), a hash that is a content id (only 64-hex under a secret-looking name is high; a bare hex value is medium).
-It also sends one read-only GET per parameterless GET endpoint and role, so endpoints no other engine called are covered.
+low and 'verify'), a hash that is a content id (only 64-hex under a secret-looking name is reported).
+Names are matched on whole words after camelCase/hyphen normalisation (`accessToken` -> `access_token`, `passenger` is not `pass`).
 Status: ran_ok only when at least one JSON response body was inspected; otherwise skipped_no_spec with the reason.
 """
 import json
@@ -18,14 +22,21 @@ import re
 import api as api_mod
 import trust
 
-SECRET_NAME = re.compile(r"(pass(word|wd)?|pwd|secret|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|"
-                         r"(^|_)hash(ed)?($|_)|sha\d*|digest|salt|invite[_-]?code|ssn|card[_-]?number|cvv|otp|totp|session[_-]?id|sid$)", re.I)
-TOKEN_NAME = re.compile(r"(^|_)(access_|refresh_|id_|auth_|bearer_|api_)?token$", re.I)
-SAFE_NAME = re.compile(r"(^has_|^is_|_count$|_at$|_url$|_policy$|_required$|_enabled$|^max_|^min_)", re.I)
-ISSUE_PATH = re.compile(r"(login|signin|sign-in|logout|token|refresh|session|auth|oauth|password|reset|forgot|register|signup|invite)", re.I)
+# Names are normalised first (_norm): camelCase -> snake_case, '-' -> '_', lower case. Every pattern is anchored to whole words.
+SECRET_NAME = re.compile(r"(^|_)(pass|passwd|password|pwd|secret|client_secret|private_?key|api_?key|access_?key|hash|hashed|sha\d*|"
+                         r"digest|salt|invite_?code|ssn|card_?number|cvv|otp|totp|session_?id|sid)($|_)")
+# the strongest names: a value under one of these on a response is reported as high (the rest are low, 'verify')
+STRONG_NAME = re.compile(r"(^|_)(pass|passwd|password|pwd|secret|client_secret|private_?key|api_?key|hash|hashed|sha\d*|salt)($|_)")
+TOKEN_NAME = re.compile(r"(^|_)(access_|refresh_|id_|auth_|bearer_|api_)?token$")
+# no _url$ here: a reset URL carries the reset token, so a URL under a secret-looking name must still be inspected
+SAFE_NAME = re.compile(r"(^has_|^is_|_count$|_at$|_policy$|_required$|_enabled$|^max_|^min_)")
+# whole path segments only: '/authors' is not 'auth', '/tokenizer' is not 'token'; '/oauth2/token' and '/sessions' still match
+ISSUE_PATH = re.compile(r"(?<![a-z])(login|signin|sign-in|logout|tokens?|refresh|sessions?|auth|oauth2?|password|reset|forgot|"
+                        r"register|signup|sign-up|invites?)(?![a-z])", re.I)
 BCRYPT = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$", re.I)
 PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+ID_SEGMENT = re.compile(r"/[0-9a-fA-F-]{6,}|/\d+")          # path ids, normalised to /{id} (kept out of the f-string: py3.11)
 
 
 def _walk(node, path=""):
@@ -39,13 +50,19 @@ def _walk(node, path=""):
         yield path, node
 
 
+def _norm(leaf: str) -> str:
+    """'accessToken' -> 'access_token', 'Pass-Word' -> 'pass_word'. Lets the whole-word patterns see camelCase names."""
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", leaf).replace("-", "_").lower()
+
+
 def _redact(v) -> str:
     s = str(v)
     return f"{s[:3]}... (len {len(s)})"
 
 
 def _sweep(api, doc, qa, cap=40):
-    """Read every parameterless GET once per configured role (read-only), so an endpoint no other engine called is still inspected."""
+    """Send every parameterless GET once per configured role, so an endpoint no other engine called is still inspected.
+    These are GETs, not verified read-only: a GET may change state (see the module docstring and qa.SKIP)."""
     skip = set(getattr(qa, "SKIP", ()) or ())
     n = 0
     for ep in api_mod.endpoints(doc):
@@ -71,27 +88,31 @@ def run(api, doc, qa=None) -> dict:
         inspected += 1
         issuing = bool(ISSUE_PATH.search(e["path"])) and e["method"] in ("POST", "PUT")
         for fpath, value in _walk(body):
-            leaf = fpath.rsplit(".", 1)[-1].replace("[*]", "")
+            leaf = _norm(fpath.rsplit(".", 1)[-1].replace("[*]", ""))
             if value is None or isinstance(value, bool) or value == "" or SAFE_NAME.search(leaf):
                 continue
             by_name = bool(SECRET_NAME.search(leaf)) or (bool(TOKEN_NAME.search(leaf)) and not issuing)
+            strong_name = bool(STRONG_NAME.search(leaf))
             by_value = isinstance(value, str) and (bool(BCRYPT.match(value)) or bool(PEM.search(value)) or (bool(HEX64.match(value)) and by_name))
-            if issuing and not by_value:
+            # an issuing endpoint legitimately returns tokens and session ids; a password, hash or secret field in its response is still a leak
+            if issuing and not (by_value or strong_name):
                 continue
             if not (by_name or by_value):
                 continue
-            ep = f"{e['method']} {re.sub(r'/[0-9a-fA-F-]{6,}|/\d+', '/{id}', e['path'])}"
+            ep = e["method"] + " " + ID_SEGMENT.sub("/{id}", e["path"])
             key = (ep, fpath)
             if key in seen or f"{ep} {fpath}" in allow:
                 continue
             seen.add(key)
-            strong = by_value or bool(re.search(r"pass|secret|private|hash|sha\d|salt|api[_-]?key", leaf, re.I))
+            strong = by_value or strong_name
             # weak names (invite_code, session id, a token in a profile) are legitimate for the owner: low, 'who may see it' is the question
             findings.append({"kind": "EXPOSURE-SECRET-FIELD", "severity": "high" if strong else "low", "endpoint": ep,
                              "detail": f"response field {fpath!r} looks like a credential/secret ({_redact(value)}; role {e['role']}). "
                                        f"{'verify: legitimate for its owner, but confirm no other role receives it' if not strong else 'a response should not carry it'}"})
-    res = {"engine": "exposure", "findings": findings, "notes": [f"{inspected} JSON response(s) inspected ({swept} read-only GETs sent by this engine)"],
-           "probes": inspected}
+    notes = [f"{inspected} JSON response(s) inspected ({swept} GETs sent by this engine's sweep)"]
+    if swept:
+        notes.append("the sweep GETs are not verified read-only: a GET may have changed state on the target; exclude with qa.SKIP")
+    res = {"engine": "exposure", "findings": findings, "notes": notes, "probes": inspected}
     if inspected == 0:
         return trust.mark(res, trust.SKIPPED, "no successful JSON response was logged: nothing to inspect")
     return trust.mark(res, trust.RAN_OK)

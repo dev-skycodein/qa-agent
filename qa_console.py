@@ -216,7 +216,7 @@ def cmd_run(a):
     cfg = derive_profile(cfg, run_dir)
     worst = EXIT_OK
     all_findings, log_parts, cmds = [], [], []
-    for seed in seeds:
+    for i, seed in enumerate(seeds):
         out = run_dir / (f"seed-{seed}" if seed is not None else "engines-out")
         cmd = build_cmd(cfg, out, seed, a.engines, shuffle_engines=getattr(a, "shuffle_engines", False),
                         fail_on_findings=a.fail_on_findings, strict=a.strict)
@@ -233,10 +233,11 @@ def cmd_run(a):
             for f in r.get("findings", []):
                 all_findings.append({**f, "engine": r["engine"], "seed": seed, "fingerprint": fingerprint(f)})
         worst = max(worst, trust.exit_code(results, a.fail_on_findings, a.strict))
-        if seed is None or seed == seeds[0]:
+        if i == 0:
             base = results                                   # trust table of the first seed stands for the run
-        else:
-            base = base + [r for r in results if "engine-error" in r]       # an errored engine in any seed taints the run
+        else:                                                # a later seed that errored, degraded, failed setup or was skipped taints the run
+            base = base + [{**r, "status_reason": f"seed {seed}: {trust.resolve(r)[1]}"}
+                           for r in results if trust.resolve(r)[0] != trust.RAN_OK]
     summary = trust.summarize(base)
     (run_dir / "engines.json").write_text(json.dumps(base, indent=2, default=str), encoding="utf-8")
     (run_dir / "trust.json").write_text(json.dumps({**summary, "verdict": trust.verdict(summary)}, indent=2), encoding="utf-8")
@@ -261,7 +262,8 @@ def print_run(r: dict):
     seen = {}
     for f in r["findings"]:
         seen.setdefault(f["fingerprint"], []).append(f)
-    for fp, group in sorted(seen.items(), key=lambda kv: kv[1][0].get("severity", "")):
+    rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}     # alphabetical order put info before low
+    for fp, group in sorted(seen.items(), key=lambda kv: rank.get(kv[1][0].get("severity"), 9)):
         f = group[0]
         k = len({g.get("seed") for g in group})
         print(f"  [{f['severity']:6}] {f['kind']:20} {f['endpoint']}  {hit_rate(k, seed_count(r))}  {fp}\n"

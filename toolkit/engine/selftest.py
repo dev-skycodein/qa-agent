@@ -1,5 +1,5 @@
 """Toolkit self-test: run the generic engines against the demo Flask shop (12 planted bugs, different stack
-from a private QA run) and assert every bug class is found. Needs only `python` + uv (downloads flask/hypothesis).
+from an internal test app) and assert every bug class is found. Needs only `python` + uv (downloads flask/hypothesis).
 
   python engine/selftest.py               # ~2-4 min, exit code 0 = engines work (the canary)
   python engine/selftest.py --with-clean  # + the same engines on the FIXED demo app: no high/medium finding allowed (false-positive control)
@@ -52,6 +52,7 @@ def run_engines(out: Path, fixed: bool = False, bugs: str | None = None, engines
            "--out", str(out), "--examples", str(examples), "--steps", "12", "--seed", str(seed)]
     if engines:
         cmd += ["--engines", engines]
+    (out / "engines.json").unlink(missing_ok=True)   # a stale file from an earlier run must never stand in for this run's output
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "PYTHONUTF8": "1"})
     for leftover in DEMO.glob("qa_demo_flask_shop.db"):
         leftover.unlink()
@@ -63,6 +64,10 @@ def run_engines(out: Path, fixed: bool = False, bugs: str | None = None, engines
 
 def check_planted() -> int:
     results, proc = run_engines(OUT, fixed=False)
+    if proc.returncode != 0:
+        print(proc.stdout[-2000:], proc.stderr[-2000:])
+        print(f"SELFTEST FAILED: engine run exited with code {proc.returncode}")
+        return 1
     if results is None:
         print(proc.stdout[-2000:], proc.stderr[-2000:])
         print("SELFTEST FAILED: engines produced no output")
@@ -85,6 +90,10 @@ def check_clean() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="qa-selftest-clean-"))
     try:
         results, proc = run_engines(tmp, fixed=True)
+        if proc.returncode != 0:
+            print(proc.stdout[-2000:], proc.stderr[-2000:])
+            print(f"CLEAN CONTROL FAILED: engine run exited with code {proc.returncode}")
+            return 1
         if results is None:
             print(proc.stdout[-2000:], proc.stderr[-2000:])
             print("CLEAN CONTROL FAILED: engines produced no output")

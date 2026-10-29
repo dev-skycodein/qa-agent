@@ -3,9 +3,13 @@
 Starts, inside safe_run.py, a local HTTP(S)-proxy + fake third-party API + fake SMTP server. The app is started with
 HTTP(S)_PROXY / ALL_PROXY pointing at the sink (and NODE_USE_ENV_PROXY=1 so Node's fetch obeys it), so:
 
-  * every outbound call the app attempts (LLM, payment, email API, analytics, webhooks, Sentry) is RECORDED and BLOCKED
-    (HTTPS CONNECT is answered 502; plain HTTP gets a canned 200 so the app keeps working)
-  * mail sent via SMTP is captured (subject, recipients, full body) - bugs that only exist in outbound email / HTML
+  * outbound calls that USE THE PROXY ENV VARS are RECORDED and BLOCKED (HTTPS CONNECT to hosts not in sink_allow is
+    answered 502; plain HTTP gets a canned 200 so the app keeps working). Allow-listed CONNECTs are tunnelled and recorded.
+  * NOT covered: a client that ignores the proxy env vars (raw sockets, trust_env=False, DB / Redis / SMTP drivers that
+    connect directly, Java, DNS lookups). Such egress is neither recorded nor blocked by this sink. This is a documented
+    limit: the sink is an observer for proxy-aware clients, not a network firewall. Do not claim "all outbound blocked".
+  * mail sent via SMTP is captured only when the app is pointed at the sink (e.g. SMTP_HOST={sink_smtp_host}); sink.env()
+    does not set any SMTP variable (subject, recipients, full body) - bugs that only exist in outbound email / HTML
   * calls to a mocked base URL (profile "mock_env", e.g. {"LLM_BASE_URL": "{sink_http}"}) arrive as direct requests with the
     full plaintext body: the exact prompt / payload the app builds
 
@@ -18,6 +22,7 @@ Use directly (for tests):  python sink.py --log sink.jsonl   (prints the ports, 
 """
 import argparse
 import json
+import re
 import select
 import socket
 import socketserver
@@ -31,12 +36,50 @@ CANNED = {"qa_sink": True, "candidates": [{"content": {"parts": [{"text": "QA-SI
     {"message": {"role": "assistant", "content": "QA-SINK canned reply"}}], "text": "QA-SINK canned reply", "ok": True, "id": "qa-sink"}
 
 
-_CREDENTIAL_HEADERS = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+# Header names whose VALUE is never stored: anything credential-like (X-Goog-Api-Key, X-Auth-Token, X-CSRF-Token...), not only a
+# fixed list of four names.
+_CREDENTIAL_HEADER_RX = re.compile(r"authorization|cookie|key|token|secret|session|csrf|password|passwd", re.I)
+MAX_BODY_READ = 4_000_000     # bytes kept from one request body (chunked or not); the rest is read and dropped
+
+# Secret shapes. Shared with outbound.py (its OUTBOUND-LEAK engine), so there is one list.
+SECRET_PATTERNS = [
+    ("password in payload", re.compile(r'"(password|passwd|pwd)"\s*:\s*"[^"]{1,}"', re.I)),
+    ("api key / token in payload or URL", re.compile(r"AIza[0-9A-Za-z_\-]{30,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|"
+                                                      r"[?&](api_?key|access_?token|token|secret)=[^&\s]{8,}", re.I)),
+    ("session JWT sent to third party", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    # Visa, Mastercard, Discover (16 digits) and Amex (15 digits, 3[47]).
+    ("card number", re.compile(r"\b(?:4\d{3}|5[1-5]\d{2}|6(?:011|5\d{2}))[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b"
+                               r"|\b3[47]\d{2}[ -]?\d{6}[ -]?\d{5}\b")),
+]
 
 
 def redact_headers(pairs) -> dict:
-    """Header dict for the run folder: credential values are replaced, the header names are kept."""
-    return {k: ("<redacted>" if k.lower() in _CREDENTIAL_HEADERS else v) for k, v in pairs}
+    """Header dict for the run folder: credential-like values are replaced, the header names are kept."""
+    return {k: ("<redacted>" if _CREDENTIAL_HEADER_RX.search(str(k)) else v) for k, v in pairs}
+
+
+def scrub_text(text: str, where: str) -> tuple:
+    """(text with every secret-shaped match replaced by <redacted:label>, hits). Hits: [{"label", "where", "chars"}]. The secret
+    itself is not returned: the run folder keeps the redacted text and the label only."""
+    hits = []
+    for label, rx in SECRET_PATTERNS:
+        def _sub(m, label=label):
+            hits.append({"label": label, "where": where, "chars": len(m.group(0))})
+            return f"<redacted:{label}>"
+        text = rx.sub(_sub, text)
+    return text, hits
+
+
+def header_secret_hits(pairs) -> list:
+    """Secrets found in the RAW header values, before redaction. Only labels, header names and match lengths are kept:
+    the secret itself never reaches the run folder. Output: [{"label", "header", "chars"}]."""
+    hits = []
+    for k, v in pairs:
+        for label, rx in SECRET_PATTERNS:
+            m = rx.search(str(v))
+            if m:
+                hits.append({"label": label, "header": str(k), "chars": len(m.group(0))})
+    return hits
 
 
 class Sink:
@@ -60,12 +103,31 @@ class Sink:
                 pass
 
             def _body(self):
+                if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                    # chunked request: read every chunk (keeps the connection framed); keep at most MAX_BODY_READ bytes
+                    out = bytearray()
+                    while True:
+                        line = self.rfile.readline(65537)
+                        try:
+                            size = int(line.split(b";")[0].strip() or b"x", 16) if line else 0
+                        except ValueError:
+                            break
+                        if size == 0:
+                            while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
+                                pass                              # trailers, then the blank line
+                            break
+                        data = self.rfile.read(size)
+                        self.rfile.readline(65537)                # CRLF after each chunk
+                        if len(out) < MAX_BODY_READ:
+                            out += data[:MAX_BODY_READ - len(out)]
+                    return bytes(out).decode("utf-8", "replace")
                 n = int(self.headers.get("Content-Length") or 0)
                 return self.rfile.read(n).decode("utf-8", "replace") if n else ""
 
             def do_CONNECT(self):                                   # HTTPS: only host:port is visible; refuse unless allow-listed
                 host, _, port = self.path.partition(":")
                 if host in sink.allow:                              # package registries only: launchers (uv, npm) need them at start-up
+                    sink.record({"kind": "connect", "host": self.path, "via": "tunnel"})   # tunnelled, not blocked, but recorded
                     try:
                         upstream = socket.create_connection((host, int(port or 443)), timeout=15)
                     except OSError:
@@ -110,11 +172,18 @@ class Sink:
                 body = self._body()
                 target = self.path                                   # absolute URI when used as proxy, path when mocked directly
                 is_proxy = target.startswith("http")
+                raw_headers = list(self.headers.items())
+                # secrets in the URL (?api_key=...) and body are replaced before anything is written; the hits are kept as labels
+                target_clean, path_hits = scrub_text(target, "path")
+                body_clean, body_hits = scrub_text(body, "body")
+                # scan the RAW headers first: redaction below hides the values the leak engine would need to see
                 sink.record({"kind": "http", "via": "proxy" if is_proxy else "direct", "method": self.command,
-                             "host": self.headers.get("Host", ""), "path": target,
+                             "host": self.headers.get("Host", ""), "path": target_clean,
                              # credentials never reach the run folder: the value is replaced, the header name is kept
-                             "headers": redact_headers(self.headers.items()),
-                             "body": body[:20000]})
+                             "headers": redact_headers(raw_headers),
+                             "header_leaks": header_secret_hits(raw_headers),
+                             "body_leaks": path_hits + body_hits,
+                             "body": body_clean[:20000]})
                 data = json.dumps(CANNED).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -157,7 +226,10 @@ class Sink:
                         raw = "".join(buf)
                         head, _, body = raw.partition("\r\n\r\n") if "\r\n\r\n" in raw else raw.partition("\n\n")
                         subject = next((h[8:].strip() for h in head.splitlines() if h.lower().startswith("subject:")), "")
-                        sink.record({"kind": "smtp", "from": mail_from, "to": rcpts, "subject": subject, "headers": head[:2000], "body": body[:20000]})
+                        body_clean, body_hits = scrub_text(body, "smtp-body")
+                        head_clean, head_hits = scrub_text(head, "smtp-headers")
+                        sink.record({"kind": "smtp", "from": mail_from, "to": rcpts, "subject": subject, "headers": head_clean[:2000],
+                                     "body_leaks": head_hits + body_hits, "body": body_clean[:20000]})
                         w("250 queued")
                         mail_from, rcpts = None, []
                     elif up == "QUIT":

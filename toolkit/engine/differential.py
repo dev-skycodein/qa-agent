@@ -52,7 +52,6 @@ A's roles), BODIES (shared with the other engines), setup(api) (fixtures: its BO
 """
 import argparse
 import copy
-import fnmatch
 import importlib.util
 import itertools
 import json
@@ -85,6 +84,10 @@ MALFORMED_JSON = b'{"qa": '
 ABSENT = "\x00absent"          # sentinel: a list item has no such field (cannot occur in JSON text)
 UNIQUE_KEY = re.compile(r"e-?mail|user-?name|login|handle|slug|code|sku", re.I)
 IDLIKE_KEY = re.compile(r"^(id|_id|uuid|pk)$|(_id|Id|ID)$")
+# a code the API checks against a list (country, currency, language, postal, status, error ...): never varied by _vary
+CLASSIFIER_KEY = re.compile(r"(country|currency|lang|language|locale|region|state|postal|zip|status|error|tax|gender|type|category)_?code$", re.I)
+LIST_KEYS = ("items", "data", "results")        # the key a paginated list answer keeps its rows under
+LIST_LEN = tuple(f"{k}.#len" for k in LIST_KEYS)
 TIMELIKE_KEY = re.compile(r"(_at|At|time|Time|date|Date|expires|ts|timestamp)$")
 VOLATILE_RX = [
     ("<uuid>", re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")),
@@ -165,13 +168,19 @@ def _suffix(v: str, tag: str) -> str:
     return f"{local}+{tag}@{domain}" if at else f"{v}-{tag}"
 
 
+def _skip_varying(k: str) -> bool:
+    """Identifier-like and classifier fields are NOT made unique: a suffix on a reference (customer_id) or on a value the API
+    validates against a list (country_code "US" -> "US-r1") is rejected or changes the answer, and that is noise, not a regression."""
+    return bool(IDLIKE_KEY.search(k) or CLASSIFIER_KEY.search(k))
+
+
 def _vary(obj, run_idx: int, subs: dict, k=None):
     """Make unique-ish body values (email / username / ...) distinct per run; remember every value -> token."""
     if isinstance(obj, dict):
         return {kk: _vary(x, run_idx, subs, kk) for kk, x in obj.items()}
     if isinstance(obj, list):
         return [_vary(x, run_idx, subs, k) for x in obj]
-    if isinstance(obj, str) and k and UNIQUE_KEY.search(k):
+    if isinstance(obj, str) and k and UNIQUE_KEY.search(k) and not _skip_varying(k):
         token = f"<U:{k}>"
         subs[obj] = token
         if run_idx == 0:
@@ -276,12 +285,23 @@ def _skipped(step: dict, i: int, why: str = "") -> dict:
             "group": step.get("group", 0), "omitted": {}, "filter": None, "items": None, "query": None, "why": why}
 
 
+def _list_key(js):
+    """The LIST_KEYS entry that holds the rows of a list answer ('items', 'data' or 'results'), or None."""
+    if not isinstance(js, dict):
+        return None
+    for k in LIST_KEYS:
+        if isinstance(js.get(k), list):
+            return k
+    return None
+
+
 def _items(js, flt, ids, subs):
     """For a filter probe: [{"id": token, "f": the filtered field as text or ABSENT}] of the returned items, else None."""
-    if not flt or not isinstance(js, dict) or not isinstance(js.get("items"), list):
+    key = _list_key(js)
+    if not flt or key is None:
         return None
     out = []
-    for it in js["items"]:
+    for it in js[key]:
         if not isinstance(it, dict):
             continue
         fv = it.get(flt["param"], ABSENT)
@@ -291,10 +311,10 @@ def _items(js, flt, ids, subs):
 
 
 def _page_size_of(js):
-    """(total, page_size) of a paginated list answer, or None."""
+    """(total, page_size) of a paginated list answer, or None. 'count' is taken as the total when there is no 'total'."""
     if not isinstance(js, dict):
         return None
-    t, s = js.get("total"), js.get("page_size")
+    t, s = js.get("total", js.get("count")), js.get("page_size")
     if isinstance(t, (int, str)) and str(t).isdigit() and isinstance(s, int) and s > 0:
         return int(t), s
     return None
@@ -912,12 +932,17 @@ def learn_noise(run_a, noise_runs) -> dict:
     return noise
 
 
+def _glob(pat: str):
+    """Shell-style '*' and '?' only. Unlike fnmatch, '[' and ']' are literal, so 'items[*].priority' names the path the diff prints."""
+    return re.compile("".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pat) + r"\Z", re.S)
+
+
 def _allowed(label: str, jpath: str, patterns: list) -> bool:
     for pat in patterns:
         parts = pat.split(None, 2)
-        if len(parts) == 2 and fnmatch.fnmatchcase(label, pat.strip()):
+        if len(parts) == 2 and _glob(pat.strip()).match(label):
             return True
-        if len(parts) == 3 and fnmatch.fnmatchcase(f"{label} {jpath}", pat.strip()):
+        if len(parts) == 3 and _glob(pat.strip()).match(f"{label} {jpath}"):
             return True
     return False
 
@@ -946,9 +971,9 @@ def _paging_kind(change, jpath, ra):
     """'past-end' / 'default' when a list answer differs in a way that is about paging, else None."""
     if ra["method"] != "GET" or "{" in ra["tpl"]:
         return None
-    if (ra.get("variant") or "").startswith("past-end") and change == "len" and jpath == "items.#len":
+    if (ra.get("variant") or "").startswith("past-end") and change == "len" and jpath in LIST_LEN:
         return "past-end"
-    if ra.get("query") is None and change in ("len", "value") and jpath in ("items.#len", "page_size"):
+    if ra.get("query") is None and change in ("len", "value") and jpath in LIST_LEN + ("page_size",):
         return "default"
     return None
 
@@ -1156,6 +1181,15 @@ def _run_pair(api_a, api_b, pair_fn, noise_fn, noise_runs, expect, ignore, extra
     b_down = bool(answered) and all(r["transport"] for r in answered)
     if noise_runs <= 0:
         extra_notes.append("setup: noise learning disabled (noise_runs=0): volatile fields will be reported")
+    # Two 401s (or two anon answers) prove nothing about access control: when no step ever ran under a login on either side,
+    # the run is DEGRADED through a "setup:" note (which _finish turns into a reason), never ran_ok.
+    # Narrowed on purpose: a public API that answers 200 to anon is still compared (its refusals are not the issue); only the
+    # case where nothing authenticated AND every answer was a refusal (401/403) is degraded.
+    steps = [r for r in list(run_a) + list(run_b) if not r.get("skipped") and not r.get("transport")]
+    authed = any(r.get("role", "anon") != "anon" and r.get("status") not in (401,) for r in steps)
+    if steps and not authed and all(r.get("status") in (401, 403) for r in steps):
+        extra_notes.append("setup: no step authenticated on either side and every answer was a refusal (401/403): the two "
+                           "versions were not compared under a login, so no access-control result is shown")
     cmp = compare(run_a, noise, run_b, expect, ignore, pre)
     return _finish(res, cmp, total, len(run_a), b_down, extra_notes)
 
@@ -1302,9 +1336,7 @@ def main(argv=None) -> int:
     noise_runs = a.noise_runs if a.noise_runs is not None else int(getattr(qa, "DIFF_NOISE_RUNS", 1))
     if a.replay:
         entries = json.loads(Path(a.replay).read_text(encoding="utf-8"))
-        usable = [e for e in entries if e.get("method") in ("GET", "POST", "PUT", "PATCH", "DELETE") and e.get("status") != TRANSPORT_ERROR]
         res = replay_log(api_a, api_b, entries, noise_runs, expect, ignore)
-        del usable
     else:
         doc = load_openapi(a.openapi or a.a.rstrip("/") + "/openapi.json")
         notes = []

@@ -14,12 +14,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import trust
+
 HERE = Path(__file__).resolve().parent
+NUMBER_OR_OID = re.compile(r"[0-9a-f]{24}|\d+")              # kept out of the f-string below: a backslash there is a SyntaxError on py3.11
 
 
 def signature(f):
     detail = f["detail"].split(" e.g. ")[0]
-    return f"{f['kind']} | {f['endpoint']} | {re.sub(r'[0-9a-f]{24}|\d+', '#', detail)[:90]}"
+    return f"{f['kind']} | {f['endpoint']} | " + NUMBER_OR_OID.sub("#", detail)[:90]
 
 
 def main():
@@ -38,6 +41,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     seeds = [int(x) for x in a.seeds.split(",")]
     seen: dict[str, dict] = {}
+    not_clean = []                                          # (seed, engine, status, reason) for every seed/engine that did not run_ok
     for seed in seeds:
         d = out / f"seed-{seed}"
         cmd = [sys.executable, str(HERE / "safe_run.py"), "--profile", a.profile, "--wait", a.wait, "--",
@@ -53,8 +57,12 @@ def main():
             results = json.loads((d / "engines.json").read_text(encoding="utf-8"))
         except FileNotFoundError:
             print(f"[multi_run] seed {seed}: no engines.json (see seed-{seed}.log)")
+            not_clean.append((seed, "(whole run)", trust.ERRORED, f"no engines.json (exit {p.returncode}); see seed-{seed}.log"))
             continue
         for r in results:
+            status, reason = trust.resolve(r)
+            if status != trust.RAN_OK:
+                not_clean.append((seed, r.get("engine", "?"), status, reason))
             for f in r.get("findings", []):
                 if f["severity"] == "info":
                     continue
@@ -64,6 +72,13 @@ def main():
     for sig, e in sorted(seen.items(), key=lambda kv: (-len(kv[1]["seeds"]), kv[0])):
         f = e["finding"]
         lines.append(f"| {len(e['seeds'])}/{len(seeds)} | {e['engine']} | {f['severity']} | {f['kind']} | `{f['endpoint']}` | {f['detail'][:110]} |")
+    if not_clean:
+        lines += ["", "## Seeds and engines that did not run clean", "", "| seed | engine | status | reason |", "|---|---|---|---|"]
+        for seed, eng, status, reason in not_clean:
+            lines.append(f"| {seed} | {eng} | {status.upper()} | {str(reason).replace('|', '/')[:160]} |")
+        lines += ["", "A seed or engine listed here did not check what the spec asks: a finding-free result from it is weak evidence."]
+    else:
+        lines += ["", "All seeds: every engine ran_ok."]
     (out / "multi.md").write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 

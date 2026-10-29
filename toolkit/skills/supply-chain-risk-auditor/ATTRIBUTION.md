@@ -1,9 +1,7 @@
-# Attribution and licence: toolkit/skills/supply-chain-risk-auditor
+# Attribution: supply-chain-risk-auditor skill
 
-This folder contains material adapted from **Trail of Bits** `trailofbits/skills`
-(https://github.com/trailofbits/skills), licensed under **CC BY-SA 4.0**.
+Adapted from the Trail of Bits skills collection (https://github.com/trailofbits/skills), licensed CC BY-SA 4.0.
 
-- Full licence text: `../../licenses/trailofbits-CC-BY-SA-4.0.txt`.
-- Changes from the original: tests, evaluation files and assets removed, and the text edited for this toolkit's workflow.
-- Share-alike: adapted files in this folder remain under CC BY-SA 4.0 and are **not** covered by the MIT licence of the rest of the project.
-- Upstream revision: not recorded when the material was imported; the exact upstream version is unknown.
+- Licence text: `../../licenses/trailofbits-CC-BY-SA-4.0.txt` (copy in this repo), or https://creativecommons.org/licenses/by-sa/4.0/legalcode
+- Changes: trimmed (tests, evals and assets removed) and edited for this repo; see `NOTICE.md`.
+- Share-alike: this folder, as adapted, stays under CC BY-SA 4.0.

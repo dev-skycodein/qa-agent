@@ -29,6 +29,7 @@ from pathlib import Path
 SKIP_DIRS = {"node_modules", ".next", ".git", "venv", ".venv", "__pycache__", "dist", "build", "qa-report", ".claude", "coverage",
              "codefixes", "test", "tests", "__tests__", "spec", "e2e", "cypress", "frontend", "docs", "examples", "fixtures", "mocks", "stories"}
 AUTH_RX = re.compile(r"\b\w*(?:isAuthorized|authorize|requireAuth|ensureAuth|isLoggedIn|checkAuth|protect|authGuard)\w*\(|getServerSession|getToken\(|\bauth\(\)|currentUser|requireAuth|verifyToken|jwt\.verify|getSession|login_required|"
+                     r"\bwithAuth\(|getCurrentUser\(|requireUser\(|requireSession\(|"
                      r"@jwt_required|Depends\(get_current|isAuthenticated|passport\.authenticate|authMiddleware|verifyJWT", re.I)
 ADMIN_RX = re.compile(r"role\s*!==?\s*[\"'](ADMIN|admin|Admin|superuser|SUPERUSER)[\"']|!\s*is_admin|isAdmin\s*===?\s*false|"
                       r"@admin_required|requireAdmin|is_staff|role\s*(?:!=|not in)\s*[\"']admin[\"']")
@@ -82,11 +83,12 @@ def body_fields(code: str):
                 if part:
                     key, _, alias = part.partition(":")
                     fields.append((key.strip(), (alias or key).strip()))
-        for f in re.finditer(rf"\b{var}\??\.(\w+)|\b{var}\[[\"'](\w+)[\"']\]", code):
+        # method calls on the body (body.get(...), body.json()) are not fields
+        for f in re.finditer(rf"\b{var}\??\.(?!(?:get|set|has|keys|values|items|json|text|length|map|filter|trim|toString)\b)(\w+)|\b{var}\[[\"'](\w+)[\"']\]", code):
             fields.append((f.group(1) or f.group(2),) * 2)
     for f in re.finditer(r"(?:req|request)\.body\??\.(\w+)", code):
         fields.append((f.group(1),) * 2)
-    for f in re.finditer(r"""(?:b|data|payload|body|j)\s*(?:\.get\(["'](\w+)["']|\[["'](\w+)["']\])""", code):
+    for f in re.finditer(r"""\b(?:b|data|payload|body|j)\s*(?:\.get\(["'](\w+)["']|\[["'](\w+)["']\])""", code):   # \b: not "job.get"
         fields.append((f.group(1) or f.group(2),) * 2)
     seen, ordered = set(), []
     for key, alias in fields:
@@ -142,9 +144,32 @@ def next_path(rp: str):
     return "/" + "/".join(segs)
 
 
+ROUTE_RX = re.compile(r"(^|/)(src/)?(app/.*route\.(ts|js|mjs)|pages/api/.*\.(ts|js))$")
+_NOT_ROUTES = {"node_modules", ".git", "qa-report"}
+
+
+def skipped_routes(root: Path) -> list:
+    """Route files that walk() drops only because a folder name is in SKIP_DIRS (app/api/docs/route.ts, app/api/test/...)."""
+    out = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        parts = set(p.relative_to(root).parts)
+        rp = str(p.relative_to(root)).replace("\\", "/")
+        if parts & _NOT_ROUTES or not ROUTE_RX.search(rp):
+            continue
+        if parts & SKIP_DIRS:
+            out.append(rp)
+    return sorted(out)
+
+
 def discover(root: Path, base_path: str):
     models, enums = prisma_models(root)
     ops, notes = [], []
+    skipped = skipped_routes(root)
+    if skipped:
+        notes.append(f"{len(skipped)} route file(s) NOT read because a folder name is in SKIP_DIRS (docs/build/test/...): "
+                     + ", ".join(skipped[:10]) + (" ..." if len(skipped) > 10 else ""))
     for p in walk(root):
         rp = str(p.relative_to(root)).replace("\\", "/")
         t = p.read_text(encoding="utf-8", errors="replace") if p.suffix in (".ts", ".js", ".mjs", ".py", ".tsx") else ""
@@ -155,11 +180,13 @@ def discover(root: Path, base_path: str):
             if "nextauth" in path.lower() or "{...nextauth}" in path.lower():
                 notes.append(f"{path}: NextAuth handler skipped (login is done in setup())")
                 continue
+            if re.search(r"export\s+const\s*\{[^}]*\b(GET|POST|PUT|PATCH|DELETE)\b[^}]*\}\s*=", t):
+                notes.append(f"{rp}: destructured handler export (export const {{ GET, POST }} = ...) is not parsed: no operations inferred")
             for method, code in split_handlers(t).items():
                 op, auth, admin = build_op(code, models, enums, f"{rp} {method}")
                 ops.append({"method": method, "path": base_path + path, "op": op, "auth": auth, "admin": admin, "file": rp})
         elif re.search(r"(^|/)pages/api/.*\.(ts|js)$", rp):
-            path = "/" + re.sub(r"^(src/)?pages/", "", re.sub(r"\.(ts|js)$", "", rp)).replace("/index", "")
+            path = "/" + re.sub(r"/index$", "", re.sub(r"^(src/)?pages/", "", re.sub(r"\.(ts|js)$", "", rp)))   # only a trailing /index
             path = re.sub(r"\[\.?\.?\.?(\w+)\]", r"{\1}", path)
             used = [m for m in METHODS if re.search(rf"method\s*===?\s*[\"']{m}[\"']", t)] or ["GET"]
             for method in used:
@@ -272,7 +299,8 @@ RACES = []               # TODO one per counter / balance / unique business key
         body = list(((o["op"].get("requestBody") or {}).get("content", {}).get("application/json", {}).get("schema", {}).get("properties", {})))
         qs = [p["name"] for p in o["op"].get("parameters", []) if p["in"] == "query"]
         md.append(f"| `{key(o)}` | {'yes' if o['auth'] else 'NO'} | {'yes' if o['admin'] else ''} | {', '.join(body)} | {', '.join(qs)} | {o['file']} |")
-    md += ["", *[f"- note: {n}" for n in notes], "- note: bodies/types are inferred from code and the ORM schema: check required fields and enums before trusting 'accepted invalid' findings"]
+    md += ["", *[f"- note: {n}" for n in notes], "- note: bodies/types are inferred from code and the ORM schema: check required fields and enums before trusting 'accepted invalid' findings",
+           "- note: auth 'NO' means no auth call was found IN THAT HANDLER FILE. Middleware, unlisted wrappers and framework config are not read: verify every PUBLIC entry before trusting it"]
     (out / "autospec.md").write_text("\n".join(md), encoding="utf-8")
     print("\n".join(md))
 

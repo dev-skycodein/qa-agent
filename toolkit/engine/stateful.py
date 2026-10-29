@@ -32,6 +32,28 @@ def _is_engine_error(exc, first) -> bool:
     return type(exc).__module__.split(".")[0] == "hypothesis"     # by module name: no import needed to decide
 
 
+SEQUENCE_CAP = 6000     # chars of a finding's 'sequence' text (the step lines are what shrink.py replays)
+_SEQ_HEADER = "last steps before failure:"
+
+
+def failure_sequence(notes: str, tail: list, cap: int = SEQUENCE_CAP) -> str:
+    """The text of a stateful finding: the notes, the header, then the failing steps. When it is longer than `cap`, the OLDEST
+    whole step lines are dropped (a marker line says how many) and no line is cut in the middle: a cut step lost its role
+    (measured: 'r_a' read back as 'a'). The failing step (the last line) is always kept."""
+    head = (notes + "\n" if notes else "") + _SEQ_HEADER + "\n"
+    lines = list(tail)
+    kept = []
+    budget = cap - len(head)
+    for line in reversed(lines):
+        if len(line) + 1 > budget and kept:
+            break
+        kept.insert(0, line)
+        budget -= len(line) + 1
+    dropped = len(lines) - len(kept)
+    marker = [f"[... {dropped} earlier step(s) cut to fit {cap} chars]"] if dropped else []
+    return head + "\n".join(marker + kept)
+
+
 def run(api, spec_doc, qa, max_examples=25, steps=12, time_budget=240, rounds=4, seed=None, attempts=3) -> dict:
     from hypothesis import HealthCheck, settings
     from hypothesis import strategies as st
@@ -84,8 +106,8 @@ def run(api, spec_doc, qa, max_examples=25, steps=12, time_budget=240, rounds=4,
         @rule(data=st.data())
         @guarded
         def act(self, data):
-            if time.time() - started[0] > time_budget:
-                return
+            if time.time() - started[0] > time_budget or not eps:
+                return                                     # an empty action set is never drawn from (Hypothesis would raise InvalidArgument)
             ep = data.draw(st.sampled_from(eps), label="endpoint")
             if key(ep) in admin_only and admin_role in actors and data.draw(st.integers(0, 6), label="bias") > 0:
                 role = admin_role                          # admin-only endpoint: mostly act as admin, else every call is a 403
@@ -155,7 +177,11 @@ def run(api, spec_doc, qa, max_examples=25, steps=12, time_budget=240, rounds=4,
     Machine.TestCase.settings = cfg
     findings = []
     clean_tries = 0
+    empty_set = False                  # every write endpoint was removed after a failure: the search cannot continue
     for round_no in range(max(rounds, attempts)):
+        if not eps:
+            empty_set = True
+            break
         stats.pop("first", None)
         started[0] = time.time()
         try:
@@ -180,12 +206,12 @@ def run(api, spec_doc, qa, max_examples=25, steps=12, time_budget=240, rounds=4,
                 break
             if first:        # the real failure, even if Hypothesis could only report "flaky" on replay
                 detail = first["message"][:400]
-                sequence = (notes + "\n" if notes else "") + "last steps before failure:\n" + "\n".join(first["tail"])
+                sequence = failure_sequence(notes, first["tail"])
             else:
                 detail = f"{type(exc).__name__}: {str(exc)[:300]}"
-                sequence = notes + "\n" + "".join(traceback.format_exception(exc))[-1500:]
+                sequence = (notes + "\n" + "".join(traceback.format_exception(exc))[-1500:])[-1800:]
             findings.append({"kind": "STATEFUL-INVARIANT", "severity": "high", "endpoint": "(sequence)",
-                             "detail": detail, "sequence": sequence[-1800:]})
+                             "detail": detail, "sequence": sequence})
             if not first:
                 break
             # switch the failing check off so the next round can find a different bug class
@@ -199,6 +225,11 @@ def run(api, spec_doc, qa, max_examples=25, steps=12, time_budget=240, rounds=4,
                 break
     res = {"engine": "stateful", "findings": findings, "steps": stats["steps"], "rounds": round_no + 1,
            "notes": [f"no failure found in {clean_tries + 1} independent search attempts (random search: absence is not proof)"] if not findings else []}
+    if empty_set:
+        # the failing endpoint was the last write endpoint: nothing left to act on. That ends the search, it is not an app finding
+        res["notes"] = ["search ended early: no write endpoint is left to act on after the failing endpoint was removed (not a finding)"]
+        return trust.mark(res, trust.ERRORED, "no write endpoints left to act on: search ended early"
+                          + ("; the finding(s) above are real, the rest of the search was not run" if findings else ""))
     if engine_error:
         res["notes"] = res["notes"] + [f"search stopped by an error of Hypothesis itself (not an app finding): {engine_error}"]
         return trust.mark(res, trust.DEGRADED if findings else trust.ERRORED, f"Hypothesis error: {engine_error}"[:400])

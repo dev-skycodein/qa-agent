@@ -13,4 +13,4 @@ rules:
       - pattern-not: Query(..., lt=$Y, ...)
       - pattern-not: Field(..., le=$Y, ...)
       - pattern-not: Field(..., lt=$Y, ...)
-    metadata: {class: unbounded-int, learned_from: "private QA run 2026-10-15"}
+    metadata: {class: unbounded-int, learned_from: "internal testing 2026-10-15"}

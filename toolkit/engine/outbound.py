@@ -11,19 +11,38 @@
 
 Built-in leak patterns apply to request headers, URL and body of every captured entry.
 """
+import base64
+import binascii
 import json
+import quopri
 import re
 
-from sink import read_log
+from sink import read_log, SECRET_PATTERNS as LEAKS
 import trust
 
-LEAKS = [
-    ("password in payload", re.compile(r'"(password|passwd|pwd)"\s*:\s*"[^"]{1,}"', re.I)),
-    ("api key / token in payload or URL", re.compile(r"AIza[0-9A-Za-z_\-]{30,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|"
-                                                      r"[?&](api_?key|access_?token|token|secret)=[^&\s]{8,}", re.I)),
-    ("session JWT sent to third party", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
-    ("card number", re.compile(r"\b(?:4\d{3}|5[1-5]\d{2})[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b")),
-]
+_B64_RUN = re.compile(r"[A-Za-z0-9+/=\r\n]{24,}")
+
+
+def _decoded_variants(blob: str, body: str) -> list:
+    """Text a MIME part may hide the secret in: quoted-printable and base64 runs (mail bodies). The sink stores the raw body,
+    so a base64 "password" is only visible after this decode. Non-text decodes are dropped."""
+    out = [blob]
+    try:
+        out.append(quopri.decodestring(body.encode("utf-8", "replace")).decode("utf-8", "replace"))
+    except ValueError:
+        pass
+    runs = []
+    for m in _B64_RUN.finditer(body):
+        try:
+            raw = base64.b64decode(re.sub(r"\s+", "", m.group(0)), validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        txt = raw.decode("utf-8", "replace")
+        if txt and sum(c.isprintable() or c in "\r\n\t" for c in txt) / len(txt) > 0.9:
+            runs.append(txt)
+    if runs:
+        out.append("\n".join(runs))
+    return out
 
 
 def _is_email_api(e) -> bool:
@@ -58,11 +77,13 @@ def run(sink_log: str, qa) -> dict:
             hosts[host] = hosts.get(host, 0) + 1
     for host, n in sorted(hosts.items()):
         findings.append({"kind": "OUTBOUND-ATTEMPT", "severity": "info", "endpoint": host,
-                         "detail": f"app tried to reach {host} {n}x (blocked by sink). Integration exists; with blank keys it still calls out."})
+                         "detail": f"app tried to reach {host} {n}x via the proxy env vars (blocked by sink, or tunnelled if allow-listed). "
+                                   "Integration exists; with blank keys it still calls out. Clients that ignore the proxy env are not seen."})
     if mails:
         findings.append({"kind": "OUTBOUND-EMAIL", "severity": "info", "endpoint": "smtp",
                          "detail": f"{len(mails)} mail(s) captured: " + "; ".join(f"to {m['to']} '{m['subject'][:50]}'" for m in mails[:5])})
     canary = "<i>qa-canary-html</i>"
+    canary_reported = set()
     for e in entries:
         if canary not in str(e.get("body", "")):
             continue
@@ -71,25 +92,47 @@ def run(sink_log: str, qa) -> dict:
             continue            # canary only in subject / plain text: not an HTML context
         if e["kind"] == "smtp" or mail_api:
             to, subject = _mail_fields(e)
-            findings.append({"kind": "CANARY-IN-EMAIL", "severity": "high", "endpoint": f"mail to {to}",
-                             "detail": f"user-controlled HTML reached an outbound email unescaped (subject {subject[:60]!r}): HTML/header injection"})
+            key = ("email", str(to))
+            if key not in canary_reported:          # one finding per recipient set, but every entry is looked at
+                canary_reported.add(key)
+                findings.append({"kind": "CANARY-IN-EMAIL", "severity": "high", "endpoint": f"mail to {to}",
+                                 "detail": f"user-controlled HTML reached an outbound email unescaped (subject {subject[:60]!r}): HTML/header injection"})
         else:
             dest = f"{e.get('host', '')}{str(e.get('path', ''))[:60]}"
-            findings.append({"kind": "CANARY-IN-PROMPT", "severity": "info", "endpoint": dest,
-                             "detail": "user input is embedded verbatim in the outbound payload (LLM prompt / webhook / API call); "
-                                       "check the template for injection hardening and what the response is allowed to do"})
-        break
+            key = ("prompt", dest)
+            if key not in canary_reported:
+                canary_reported.add(key)
+                findings.append({"kind": "CANARY-IN-PROMPT", "severity": "info", "endpoint": dest,
+                                 "detail": "user input is embedded verbatim in the outbound payload (LLM prompt / webhook / API call); "
+                                           "check the template for injection hardening and what the response is allowed to do"})
     reported = set()
     for e in entries:
-        blob = "\n".join([str(e.get("path", "")), str(e.get("headers", "")), str(e.get("body", ""))])
-        for label, rx in LEAKS:
-            m = rx.search(blob)
-            if m and (label, e.get("host") or e["kind"]) not in reported:
-                reported.add((label, e.get("host") or e["kind"]))
-                # the secret itself is never copied into the report: show its context and its length only
-                shown = blob[max(0, m.start() - 30):m.start()] + f"<redacted {len(m.group(0))} chars>" + blob[m.end():m.end() + 30]
+        # secrets found in the raw request headers by sink.py before it redacted them (the redacted copy cannot show them)
+        for hit in e.get("header_leaks") or []:
+            key = ("header", hit.get("label"), hit.get("header"), e.get("host") or e["kind"])
+            if key not in reported:
+                reported.add(key)
                 findings.append({"kind": "OUTBOUND-LEAK", "severity": "high", "endpoint": e.get("host") or e["kind"],
-                                 "detail": f"{label}: ...{shown!r}"[:300]})
+                                 "detail": f"{hit.get('label')}: in request header '{hit.get('header')}' "
+                                           f"<redacted {hit.get('chars')} chars>"[:300]})
+        # secrets sink.py replaced in the URL / body / SMTP headers before storing them (the stored copy shows <redacted:...>)
+        for hit in e.get("body_leaks") or []:
+            key = ("body", hit.get("label"), hit.get("where"), e.get("host") or e["kind"])
+            if key not in reported:
+                reported.add(key)
+                findings.append({"kind": "OUTBOUND-LEAK", "severity": "high", "endpoint": e.get("host") or e["kind"],
+                                 "detail": f"{hit.get('label')}: in {hit.get('where')} <redacted {hit.get('chars')} chars>"[:300]})
+    for e in entries:
+        blob = "\n".join([str(e.get("path", "")), str(e.get("headers", "")), str(e.get("body", ""))])
+        for text in _decoded_variants(blob, str(e.get("body", ""))):
+            for label, rx in LEAKS:
+                m = rx.search(text)
+                if m and (label, e.get("host") or e["kind"]) not in reported:
+                    reported.add((label, e.get("host") or e["kind"]))
+                    # the secret itself is never copied into the report: show its context and its length only
+                    shown = text[max(0, m.start() - 30):m.start()] + f"<redacted {len(m.group(0))} chars>" + text[m.end():m.end() + 30]
+                    findings.append({"kind": "OUTBOUND-LEAK", "severity": "high", "endpoint": e.get("host") or e["kind"],
+                                     "detail": f"{label}: ...{shown!r}"[:300]})
     for fn in getattr(qa, "SINK_CHECKS", []):
         for e in entries:
             try:

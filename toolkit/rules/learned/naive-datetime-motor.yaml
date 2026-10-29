@@ -11,4 +11,4 @@ rules:
           - pattern: MongoClient(...)
       - pattern-not: AsyncIOMotorClient(..., tz_aware=True, ...)
       - pattern-not: MongoClient(..., tz_aware=True, ...)
-    metadata: {class: naive-datetime, learned_from: "private QA run 2026-10-15"}
+    metadata: {class: naive-datetime, learned_from: "internal testing 2026-10-15"}

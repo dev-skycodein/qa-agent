@@ -13,7 +13,7 @@ import outbound  # noqa: E402
 import sink  # noqa: E402
 import synthesize  # noqa: E402
 
-# a fake, unsigned token; built from parts so the file itself never contains a JWT-shaped literal
+# a made-up token; built from parts so the file itself does not look like a real JWT to the release scanner
 JWT = ".".join(["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJxYXRlc3QifQ", "abcdefghijklmnopqrstu"])
 
 

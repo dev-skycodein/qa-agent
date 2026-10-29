@@ -24,7 +24,9 @@ Oracles (each finding is a CANDIDATE: reproduce it as a PoC before reporting):
   MASS-ASSIGN    privileged extra field (role, isAdmin, userId, id, ...) is applied. Confirmed when the control response
                  (same request without the extra field) had a different value or a read-back GET shows it     high/medium
   XREF-IDOR      a body field that references another user's resource (ticketId, order_id, ...) is accepted      high
-  NEG-ERROR      the baseline request itself failed, so mutations of that endpoint were only checked for 5xx    note
+  (no NEG-ERROR finding) a baseline answered 4xx is a note: accept-invalid checks are skipped for that endpoint, run DEGRADED.
+                 A baseline 5xx is reported once as NEG-5XX ("baseline"); its mutations' 5xx answers are not repeated.
+                 A DELETE (or cancel) baseline changes the resource: later probes of that endpoint are noted as not independent.
 
 qa-spec.py (all optional):
   NEG_SKIP     {"POST /api/x"}            endpoints this engine must not touch (in addition to SKIP)
@@ -46,7 +48,7 @@ LEAK_PATTERNS = [
                                    r"sqlalchemy\.exc|django\.db\.utils|Unique constraint failed|SQLITE_ERROR|SQLITE_CONSTRAINT|"
                                    r"syntax error at or near|unterminated quoted string", re.I)),
     ("absolute path", re.compile(r"[A-Za-z]:[\\/]+(Users|Windows|Program Files)[\\/]|/(home|Users|var/www|usr/(local/)?lib|app|srv)/[\w.-]+/")),
-    ("secret/key", re.compile(r"AIza[0-9A-Za-z_\-]{30,}|sk-[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}")),
+    ("secret/key", re.compile(r"AIza[0-9A-Za-z_\-]{30,}|(?<![A-Za-z0-9])sk-[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}")),
     ("JWT in an error response", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.")),      # 2xx login/register tokens are intended: errors only
     ("third-party error", re.compile(r"googleapis\.com|generativelanguage|api\.openai\.com|api\.stripe\.com|"
                                      r"Method doesn't allow unregistered callers|API key (not valid|must be set)", re.I)),
@@ -155,11 +157,13 @@ _COUNTER = [0]
 
 
 def _unique(body):
-    """Copy of body with email / username / login values made unique, so repeated creates do not hit a 409 on a unique column."""
+    """Copy of body with email / username values made unique, so repeated creates do not hit a 409 on a unique column.
+    Code-like values (code, sku, handle, slug, login) are left as they are: a suffix changes them (country_code "US" -> "US7")
+    and breaks the mass-assign baseline. A repeat create of such a value may 409; the callers treat that as a setup failure."""
     _COUNTER[0] += 1
     out = dict(body)
     for k, v in body.items():
-        if isinstance(v, str) and re.search(r"e-?mail|user-?name|login|handle|slug|code|sku", k, re.I):
+        if isinstance(v, str) and re.search(r"e-?mail|user-?name", k, re.I):
             out[k] = "{}+qa{}@{}".format(*v.partition("@")[::2][:1], _COUNTER[0], v.partition("@")[2]) if "@" in v else f"{v}{_COUNTER[0]}"
     return out
 
@@ -227,7 +231,17 @@ def _find_key(doc, name):
 
 
 def _leaks(text, ok=False):
-    return [label for label, rx in LEAK_PATTERNS if rx.search(text or "") and not (ok and label == "JWT in an error response")]
+    """Leak labels found in a response body. On a 2xx (ok=True) the body is normal content: error-text patterns do not apply
+    to it (JWT and third-party error text), and a URL is data (CDN or API host, /app/<x>/ path), so the absolute-path pattern
+    does not read inside URLs. Secrets are still searched in the whole body (a key can sit in a URL's query string)."""
+    out = []
+    for label, rx in LEAK_PATTERNS:
+        if ok and label in ("JWT in an error response", "third-party error"):
+            continue
+        scan = re.sub(r"https?://\S+", " ", text or "") if (ok and label == "absolute path") else (text or "")
+        if rx.search(scan):
+            out.append(label)
+    return out
 
 
 def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
@@ -241,6 +255,8 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
     cap = max_per_endpoint or getattr(qa, "NEG_MAX", 160)
     findings, notes, seen = [], [], set()
     sent = [0]
+    base5 = [False]                    # the current endpoint's baseline answered 5xx (see check_response)
+    skipped = [0]                      # probes refused by the per-endpoint cap: counted, reported, never silently dropped
 
     def role_for(ep):
         k = key(ep)
@@ -294,7 +310,8 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                          "request": json.dumps(request, default=str)[:300] if request is not None else None})
 
     def check_response(ep, resp, desc, request, invalid=False, baseline_ok=True, write_on_missing=False):
-        if resp.server_error:
+        # a baseline that already answers 5xx is one finding; its mutations' 5xx answers would only repeat it (30 copies measured)
+        if resp.server_error and not (base5[0] and desc != "baseline"):
             add("NEG-5XX", "medium", ep, f"{desc} -> {resp.status} (expected 4xx)", resp, request, dedupe=desc)
         elif resp.transport:       # no HTTP answer at all: the app dropped the connection, hung or crashed (or the client hit a socket limit)
             add("NEG-NO-RESPONSE", "medium", ep, f"{desc} -> no HTTP response ({resp.text[:80]}): app crashed, hung or dropped the connection",
@@ -312,6 +329,7 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
             continue
         role = role_for(ep)
         budget = [cap]
+        skipped_at_start = skipped[0]
         base_body = baseline(ep)
         values = {}
         ok_ids = True
@@ -332,6 +350,7 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
 
         def send(body=None, path_=None, query=None, raw=None, ctrl=False):
             if budget[0] <= 0:
+                skipped[0] += 1
                 return None
             budget[0] -= 1
             sent[0] += 1
@@ -339,11 +358,17 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
 
         base_resp = send(base_body)
         if base_resp is None:
+            notes.append(f"{k}: request cap {cap} reached before the baseline request: endpoint not probed")
             continue
         baseline_ok = base_resp.ok
+        base5[0] = base_resp.server_error
         if not baseline_ok and base_resp.status < 500:
             notes.append(f"{k}: baseline request got {base_resp.status} as {role}; accept-invalid checks skipped (add BODIES['{k}'])")
         check_response(ep, base_resp, "baseline", base_body)
+        if baseline_ok and (ep["method"] == "DELETE" or re.search(r"cancel", ep["path"], re.I)):
+            # the baseline changed the resource it targets: probes sent after it see the state it left (e.g. a 404 for a deleted id)
+            notes.append(f"{k}: the baseline {ep['method']} changed the resource it targets; later probes of this endpoint see that state, "
+                         "so they are not independent of the baseline")
 
         # --- body mutations
         schema = ep["body_schema"]
@@ -358,13 +383,13 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                     body = {n: v for n, v in body0.items() if n != name} if value is MISSING else {**body0, name: value}
                     resp = send(body)
                     if resp is None:
-                        break
+                        continue                       # refused by the cap: counted in skipped, the next probes are counted too
                     check_response(ep, resp, f"{name}={kind}", {name: "<MISSING>" if value is MISSING else (str(value)[:40])}, invalid, baseline_ok)
                     if kind in SQLI_KINDS and _type_name(resolve(sub, spec_doc)) == "string":
                         verdict = sqli_differential(lambda v: send({**body0, name: v}), value, _benign)
                         if verdict is not None and verdict["sev"]:
                             add("NEG-INJECTION", verdict["sev"], ep, f"{name}: SQL-shaped input is interpreted by the server ({verdict['why']}); "
-                                "SQL/NoSQL injection candidate: reproduce before reporting", verdict["true"], {name: value}, dedupe=name)
+                                "SQL injection candidate (this engine sends no NoSQL payloads): reproduce before reporting", verdict["true"], {name: value}, dedupe=name)
                         elif verdict is not None and verdict["true"].ok and not verdict["benign"].ok:
                             add("NEG-ACCEPTED", "low", ep, f"{name}: SQL-shaped input is accepted ({verdict['true'].status}) while the benign value is "
                                 f"rejected ({verdict['benign'].status}); acceptance alone is not injection evidence", verdict["true"], {name: value}, dedupe=name)
@@ -379,7 +404,7 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
             for bad in PATH_IDS:
                 resp = send(base_body, path_=fill(ep["path"], {ep["path_params"][0]: quote(bad, safe="%./")}))
                 if resp is None:
-                    break
+                    continue
                 shown = bad if len(bad) < 30 else bad[:12] + f"...({len(bad)} chars)"
                 check_response(ep, resp, f"{ep['path_params'][0]}={shown!r}", None, False, baseline_ok,
                                write_on_missing=(ep["method"] in WRITE_METHODS and bad == "__qa_nonexistent__"))
@@ -394,7 +419,7 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
             for kind, v in vals:
                 resp = send(base_body, query={q["name"]: v})
                 if resp is None:
-                    break
+                    continue
                 check_response(ep, resp, f"?{q['name']}={kind}", None, False, baseline_ok)
                 # the same differential as bodies: a tagged TRUE / FALSE / benign comparison; a payload that merely matches data
                 # the engine stored (exact-match filter) cannot answer differently, because the tagged form was never stored
@@ -405,11 +430,9 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                             f"({verdict['why']}); injection candidate: reproduce before reporting", verdict["true"], {q["name"]: v}, dedupe=q["name"])
 
         # --- mass assignment (create / update with privileged extras)
-        if ep["method"] in ("POST", "PUT", "PATCH") and isinstance(base_body, dict) and budget[0] > 0:
+        if ep["method"] in ("POST", "PUT", "PATCH") and isinstance(base_body, dict):
             props = set((schema or {}).get("properties", {}))
             for variant in (PRIVILEGED, PRIVILEGED_ALT):
-                if budget[0] <= 0:
-                    break
                 extras = {n: v for n, v in variant.items() if n not in props}
                 control = send(_unique(base_body))
                 resp = send({**_unique(base_body), **extras})
@@ -452,7 +475,10 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                     continue
                 stem = re.sub(r"[^a-z]", "", m.group(1).lower())
                 coll = next((c for c in creators if re.sub(r"[^a-z]", "", c.split("/")[-1].lower()).rstrip("s") == stem.rstrip("s")), None)
-                if not coll or budget[0] <= 0:
+                if not coll:
+                    continue
+                if budget[0] <= 0:
+                    skipped[0] += 2                    # the control and the attack request this check would send
                     continue
                 owner = owner_map.get(f"POST {coll}", "user_a")
                 if owner == "user_b" or owner not in api.roles:
@@ -465,10 +491,17 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                 att = api.call("user_b", ep["method"], path, {**base_body, name: victim_id})
                 sent[0] += 2
                 if ctrl.ok and att.ok:
-                    add("XREF-IDOR", "high", ep, f"user_b can reference user_a's {coll} via body field {name} ({att.status})", att,
+                    # medium: the server accepted the reference. No effect on user_a's data was read back, so access is not proven
+                    add("XREF-IDOR", "medium", ep, f"user_b's request referencing user_a's {coll} via body field {name} was accepted "
+                        f"({att.status}); no effect on user_a's data was read back (not proven access)", att,
                         {name: victim_id}, dedupe=name)
 
-    res = {"engine": "negative", "findings": _group(findings), "notes": notes, "requests": sent[0], "raw_findings": len(findings)}
+        if skipped[0] > skipped_at_start:
+            notes.append(f"{k}: request cap {cap} reached: {skipped[0] - skipped_at_start} probe(s) not sent "
+                         "(later field mutations, mass-assign, path and query probes); raise NEG_MAX in qa-spec.py to cover them")
+
+    res = {"engine": "negative", "findings": _group(findings), "notes": notes, "requests": sent[0], "raw_findings": len(findings),
+           "probes_skipped": skipped[0]}
     if notes:
         return trust.mark(res, trust.DEGRADED, f"{len(notes)} probe group(s) skipped or limited: " + notes[0][:140])
     return trust.mark(res, trust.RAN_OK)

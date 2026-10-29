@@ -51,7 +51,7 @@ def _broken(engine: str, what: str, tail: int) -> dict:
 
 
 def finish(results: list, out: Path, a) -> int:
-    """Write engines.json / engines.md / trust.json, print the report, return the exit code (see module docstring)."""
+    """Write engines.json / engines.md / trust.json, print the report, return the exit code (exit codes: trust.exit_code)."""
     out.mkdir(parents=True, exist_ok=True)
     summary = trust.summarize(results)
     (out / "engines.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
@@ -61,9 +61,9 @@ def finish(results: list, out: Path, a) -> int:
     for r in results:
         fs = r.get("findings", [])
         total += len(fs)
-        lines.append(f"## {r['engine']}: {len(fs)} finding(s) [{trust.resolve(r)[0].upper()}]")
+        lines.append(f"## {r.get('engine', '?')}: {len(fs)} finding(s) [{trust.resolve(r)[0].upper()}]")
         for f in fs:
-            lines.append(f"- **{f['severity']} {f['kind']}** `{f['endpoint']}` — {f['detail']}")
+            lines.append(f"- **{f.get('severity', '?')} {f.get('kind', '?')}** `{f.get('endpoint', '?')}` — {f.get('detail', '')}")
             if f.get("sequence"):
                 seq = f["sequence"] if isinstance(f["sequence"], str) else "\n".join(str(x) for x in f["sequence"])
                 lines.append("  ```\n  " + seq.replace("\n", "\n  ") + "\n  ```")
@@ -148,12 +148,12 @@ def main():
     try:
         roles = qa.setup(api) if hasattr(qa, "setup") else {}
         api.roles.update(roles or {})
-    except Exception:
+    except (Exception, SystemExit):                                        # a setup() that calls sys.exit() is a failed setup
         sys.exit(finish([_broken("setup", "qa-spec setup() failed", 1200)], out, a))
     openapi_src = a.openapi or getattr(qa, "OPENAPI", None) or a.base_url.rstrip("/") + "/openapi.json"
     try:
         doc = api_mod.load_openapi(openapi_src)
-    except Exception:
+    except (Exception, SystemExit):
         sys.exit(finish([_broken("openapi", f"cannot load OpenAPI from {openapi_src}", 1200)], out, a))
     if a.preflight:
         sys.exit(preflight(qa, doc, roles))
@@ -200,7 +200,7 @@ def main():
             else:
                 results.append({"engine": name, "findings": [], "notes": [f"unknown engine {name}"],
                                 "engine-error": f"unknown engine {name!r}: nothing ran"})
-        except Exception:  # engine bug or unsupported app: report, keep going
+        except (Exception, SystemExit):  # engine bug, sys.exit() inside an engine, or unsupported app: report, keep going
             results.append({"engine": name, "findings": [], "engine-error": traceback.format_exc()[-1200:]})
 
     try:
@@ -208,9 +208,12 @@ def main():
     except Exception:
         results.append({"engine": "dbcheck", "findings": [], "engine-error": traceback.format_exc()[-800:]})
     if os.environ.get("QA_APP_DIR") and "static" in engine_names:
-        sf = [{"kind": f["kind"], "severity": f["severity"], "endpoint": f["file"], "detail": f["detail"]}
-              for f in static_checks.run(Path(os.environ["QA_APP_DIR"]))]
-        results.append(trust.mark({"engine": "static", "findings": sf, "notes": []}, trust.RAN_OK))
+        try:
+            sf = [{"kind": f["kind"], "severity": f["severity"], "endpoint": f["file"], "detail": f["detail"]}
+                  for f in static_checks.run(Path(os.environ["QA_APP_DIR"]))]
+            results.append(trust.mark({"engine": "static", "findings": sf, "notes": []}, trust.RAN_OK))
+        except (Exception, SystemExit):
+            results.append({"engine": "static", "findings": [], "engine-error": traceback.format_exc()[-1200:]})
     elif "static" in engine_names:
         results.append(trust.mark({"engine": "static", "findings": [], "notes": ["QA_APP_DIR not set"]}, trust.SKIPPED, "QA_APP_DIR not set: source scan not run"))
 
@@ -219,6 +222,9 @@ def main():
             results.append(outbound.run(os.environ["QA_SINK_LOG"], qa))
         except Exception:
             results.append({"engine": "outbound", "findings": [], "engine-error": traceback.format_exc()[-1200:]})
+    else:   # sink off: say so in the trust table, never leave the outbound row silently absent
+        results.append(trust.mark({"engine": "outbound", "findings": [], "notes": []}, trust.DEGRADED,
+                                  "sink off (QA_SINK_LOG not set): outbound leak check did not run"))
 
     if "invariants" in engine_names:                  # opt-in: mined candidates are info-only, see invariant_miner.py
         try:

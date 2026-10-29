@@ -18,9 +18,13 @@ TRANSPORT_ERROR = 599    # pseudo-status: no HTTP response at all (refused, rese
 
 
 def assert_local(url: str) -> None:
-    host = urllib.parse.urlparse(url).hostname
-    if host not in LOCAL_HOSTS:
+    """Refuse anything that is not an http(s) URL on a loopback host (file://localhost/..., ftp://localhost/... are refused too)."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in LOCAL_HOSTS:
         raise SystemExit(f"refusing non-local target: {url}")
+
+
+_PLAIN_HEADERS = {"accept", "accept-encoding", "accept-language", "user-agent", "connection"}
 
 
 class _LocalRedirects(urllib.request.HTTPRedirectHandler):
@@ -32,9 +36,13 @@ class _LocalRedirects(urllib.request.HTTPRedirectHandler):
         if target.scheme not in ("http", "https") or target.hostname not in LOCAL_HOSTS:
             return None
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and target.netloc != urllib.parse.urlparse(req.full_url).netloc:
-            for h in ("Authorization", "Cookie", "Proxy-Authorization"):
-                new.remove_header(h)
+        origin, new_origin = urllib.parse.urlparse(req.full_url), target
+        if new is not None and (origin.scheme, origin.netloc) != (new_origin.scheme, new_origin.netloc):
+            # another scheme or host:port: drop EVERY request header except the plain ones. A role's credential can be any
+            # header name (X-API-Key, X-Auth-Token, a CSRF header), not only Authorization / Cookie.
+            for name in list(new.headers) + list(new.unredirected_hdrs):
+                if name.lower() not in _PLAIN_HEADERS:
+                    new.remove_header(name)
         return new
 
 
@@ -138,13 +146,23 @@ def header_dict(message) -> dict:
 
 # ---------- OpenAPI ----------
 
+SPEC_MAX_READ = 32_000_000      # bytes: an OpenAPI document larger than this is refused (it was read whole before)
+
+
 def load_openapi(src: str) -> dict:
-    """src: local URL (http://127.0.0.1:8000/openapi.json) or a file path."""
+    """src: local URL (http://127.0.0.1:8000/openapi.json) or a file path. The document is capped at SPEC_MAX_READ bytes.
+    The timeout is per socket operation, not for the whole download."""
     if urllib.parse.urlparse(src).scheme in ("http", "https"):
         assert_local(src)
         with _OPENER.open(src, timeout=30) as r:
-            return json.loads(r.read().decode("utf-8"))
-    return json.loads(Path(src).read_text(encoding="utf-8"))
+            raw = r.read(SPEC_MAX_READ + 1)
+    else:
+        if Path(src).stat().st_size > SPEC_MAX_READ:
+            raise SystemExit(f"refusing OpenAPI file over {SPEC_MAX_READ} bytes: {src}")
+        raw = Path(src).read_bytes()
+    if len(raw) > SPEC_MAX_READ:
+        raise SystemExit(f"refusing OpenAPI document over {SPEC_MAX_READ} bytes: {src}")
+    return json.loads(raw.decode("utf-8"))
 
 
 def resolve(schema, spec, depth=0):

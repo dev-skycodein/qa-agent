@@ -44,6 +44,7 @@ DELETE is never sent (destructive, nothing to fuzz body-wise).
 
 Usage: run(client, spec_doc, qa, seed=None, max_probes=None, per_endpoint=None) -> engine result dict (see trust.py).
 """
+import datetime
 import json
 import math
 import random
@@ -53,6 +54,11 @@ import uuid
 
 import api
 import trust
+
+# Keywords the validator does NOT check. A schema that uses one cannot be judged by it, so the operation is DEGRADED and no
+# SCHEMA-DRIFT / SCHEMA-REJECTS-VALID is reported for it (the validator would otherwise call a value valid that the schema forbids,
+# or the reverse: e.g. a writeOnly field the app rightly omits from a response is "required" to our validator).
+UNSUPPORTED = ("multipleOf", "uniqueItems", "patternProperties", "minProperties", "not", "if", "then", "else", "readOnly", "writeOnly")
 
 KIND_SEVERITY = {"SCHEMA-VALID-5XX": "medium", "SCHEMA-REJECTS-VALID": "medium", "SCHEMA-DRIFT": "low",
                  "SCHEMA-ACCEPTS-INVALID": "medium"}
@@ -300,6 +306,20 @@ def _des(lbl) -> bool:
 
 # ---------- validator (JSON-schema subset, stdlib only) ----------
 
+def _real_datetime(value: str, fmt: str) -> bool:
+    """The text already matches the format's shape (FORMATS); this checks the calendar and clock values it cannot express:
+    2026-13-45, 2026-02-30 and 25:00:00 are shaped right and still not dates or times."""
+    try:
+        datetime.date(int(value[0:4]), int(value[5:7]), int(value[8:10]))
+        if fmt == "date-time":
+            hh, mm, ss = int(value[11:13]), int(value[14:16]), int(value[17:19])
+            if hh > 23 or mm > 59 or ss > 60:
+                return False
+    except ValueError:
+        return False
+    return True
+
+
 def check(value, schema, spec) -> list:
     """Validate `value` against `schema`. Returns [(path, message, offending value)]; [] means valid.
 
@@ -307,7 +327,9 @@ def check(value, schema, spec) -> list:
     additionalProperties (false or a schema), items, minItems/maxItems, minLength/maxLength, pattern, format (email,
     date, date-time, uuid), minimum/maximum with both the 3.0 boolean and the 3.1 numeric exclusive forms, allOf (all),
     anyOf and oneOf (at least one branch matches: the lenient reading, so overlap cannot create a false drift).
-    Unknown keywords are ignored. Raises Unresolvable for an external or broken $ref."""
+    Unknown keywords are ignored, and the keywords in UNSUPPORTED are not checked at all: an operation whose schema uses one is
+    DEGRADED by _probe_op, so this validator's verdict on it is never reported as drift or rejection.
+    Raises Unresolvable for an external or broken $ref."""
     errs: list = []
     _check(value, schema, spec, "$", 0, errs)
     return errs
@@ -378,6 +400,8 @@ def _check(value, schema, spec, path, depth, errs):
         fmt = s.get("format")
         if fmt in FORMATS and not FORMATS[fmt].match(value):
             errs.append((path, f"not a valid {fmt}", value))
+        elif fmt in ("date", "date-time") and not _real_datetime(value, fmt):
+            errs.append((path, f"not a real {fmt} (month, day or time out of range)", value))
     if _num(value):
         _bounds(value, s, path, errs)
 
@@ -673,6 +697,55 @@ def _query_params(item, op, spec) -> list:
     return list(pmap.values())
 
 
+def _unsupported(schema, spec, seen=None, depth=0) -> set:
+    """The UNSUPPORTED keywords used anywhere in a schema tree (local $refs followed, each target walked once)."""
+    found: set = set()
+    if seen is None:
+        seen = set()
+    if not isinstance(schema, dict) or depth > 30:
+        return found
+    if "$ref" in schema:
+        try:
+            schema = deref(schema, spec)
+        except Unresolvable:
+            return found
+        if id(schema) in seen:
+            return found
+        seen.add(id(schema))
+    found |= {kw for kw in UNSUPPORTED if kw in schema}
+    subs = []
+    if isinstance(schema.get("properties"), dict):
+        subs += list(schema["properties"].values())
+    for kw in ("allOf", "anyOf", "oneOf"):
+        if isinstance(schema.get(kw), list):
+            subs += schema[kw]
+    for kw in ("items", "additionalProperties", "not", "if", "then", "else"):
+        if isinstance(schema.get(kw), dict):
+            subs.append(schema[kw])
+    for sub in subs:
+        found |= _unsupported(sub, spec, seen, depth + 1)
+    return found
+
+
+def _op_unsupported(op, spec) -> set:
+    """UNSUPPORTED keywords in this operation's request body, query parameters and JSON responses."""
+    found: set = set()
+    if op["body"] is not None:
+        found |= _unsupported(op["body"], spec)
+    for q in op["query"]:
+        found |= _unsupported(q.get("schema") or {}, spec)
+    for r in op["responses"].values():
+        if not isinstance(r, dict):
+            continue
+        try:
+            media = (deref(r, spec).get("content") or {}).get("application/json")
+        except Unresolvable:
+            continue
+        if isinstance(media, dict):
+            found |= _unsupported(media.get("schema") or {}, spec)
+    return found
+
+
 def _operations(spec) -> list:
     ops = []
     for path, item in (spec.get("paths") or {}).items():
@@ -697,12 +770,15 @@ def _operations(spec) -> list:
     return ops
 
 
-def _has_json_response(responses) -> bool:
+def _has_json_response(responses, spec) -> bool:
+    """True when some response declares application/json, directly or through a local $ref (_documented follows the same refs)."""
     for r in responses.values():
         try:
+            if isinstance(r, dict) and "$ref" in r:
+                r = deref(r, spec)
             if isinstance(r, dict) and "application/json" in (r.get("content") or {}):
                 return True
-        except AttributeError:
+        except (AttributeError, Unresolvable):
             continue
     return False
 
@@ -761,6 +837,7 @@ class _Run:
         self.all_ops: dict = {}          # "METHOD /path" -> operation, for id discovery
         self.role_cache: dict = {}       # operation key -> candidate roles, the first one tried first
         self.id_cache: dict = {}         # collection path -> an id the app itself handed out (or None)
+        self.unsupported: set = set()    # operation keys whose schema uses an UNSUPPORTED keyword (DRIFT/REJECTS suppressed)
 
     def note(self, msg):
         self.notes.append(msg)
@@ -924,6 +1001,8 @@ def _random_candidate(op, spec, rng):
 
 def _drift(st, op, resp, body, query, path, msg, bad):
     k = api.key(op)
+    if k in st.unsupported:
+        return                                        # DEGRADED by _probe_op: our validator cannot judge this schema
     norm = re.sub(r"\[\d+\]", "[*]", path)
     st.add("SCHEMA-DRIFT", k,
            f"{path}: {msg}; value {_j(bad)[:100]}; response {resp.status}. {_req(body, query)}; response body: {resp.text[:200]}",
@@ -975,7 +1054,7 @@ def _handle(st, op, role, path, label, body, query, resp, ctx) -> bool:
 def _rejects(st, op, role, path, rejected, control):
     """rejected: [(label, body, query, resp)] deterministic 400/422 answers. control: (label, resp) of a 2xx sibling or None."""
     k = api.key(op)
-    if not rejected:
+    if not rejected or k in st.unsupported:
         return
     if control is None:
         st.gap(f"{k}: {len(rejected)} schema-valid variant(s) answered 4xx and no 2xx control exists on this endpoint; "
@@ -1082,6 +1161,11 @@ def _accepts_invalid(st, op, role, path, body_base, method):
 
 def _probe_op(st, op, rng):
     k = api.key(op)
+    kws = _op_unsupported(op, st.spec)
+    if kws:
+        st.unsupported.add(k)
+        st.gap(f"{k}: schema uses {', '.join(sorted(kws))}, which this validator does not check: no SCHEMA-DRIFT or "
+               f"SCHEMA-REJECTS-VALID is reported for this operation (5xx checks still run)")
     method, path_t = op["method"], op["path"]
     role = _role(st, k)
     try:
@@ -1091,11 +1175,16 @@ def _probe_op(st, op, rng):
             body_list = branch_examples(op["body"], st.spec, DET_LIMIT)
             for lbl in uncovered_branches(op["body"], st.spec):
                 st.gap(f"{k}: {lbl} has no schema-valid example, so that branch is not tested")
-            if k in st.bodies:
+            if k in st.bodies and check(st.bodies[k], op["body"], st.spec):
+                # A rejected BODIES entry is not a valid baseline. It is not used, the operation is DEGRADED (a gap), and the
+                # spec-derived schema-valid examples are fuzzed instead, so their 5xx are still reported.
+                st.note(f"{k}: qa.BODIES entry fails our schema validator; it is not used as the baseline, and the spec example is")
+                st.gap(f"{k}: qa.BODIES entry rejected by our schema validator (not used as baseline)")
+                if not body_list:
+                    raise _Gap("qa.BODIES entry rejected and no schema-valid example exists; the body is not fuzzed")
+                body_base = body_list[0]["value"]
+            elif k in st.bodies:
                 body_base = st.bodies[k]
-                body_valid = not check(body_base, op["body"], st.spec)
-                if not body_valid:
-                    st.note(f"{k}: qa.BODIES entry fails our schema validator; its 5xx will not be reported as SCHEMA-VALID-5XX")
             elif body_list:
                 body_base = body_list[0]["value"]
             else:
@@ -1190,7 +1279,7 @@ def run(client, spec_doc, qa, seed=None, max_probes=None, per_endpoint=None) -> 
         if op["method"] in WRITE and op["body"] is None:
             st.note(f"{k}: no application/json request schema; not fuzzed")
             continue
-        if op["method"] == "GET" and not op["query"] and not _has_json_response(op["responses"]):
+        if op["method"] == "GET" and not op["query"] and not _has_json_response(op["responses"], spec_doc):
             st.note(f"{k}: nothing to check (no query parameters and no inline JSON response schema)")
             continue
         todo.append(op)

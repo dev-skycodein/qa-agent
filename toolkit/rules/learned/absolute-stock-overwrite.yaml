@@ -13,4 +13,4 @@ rules:
               ...
       - pattern: |
           $COLL.update_one({"_id": $ID}, {"$set": $DOC(...)})
-    metadata: {class: lost-update, learned_from: "private QA run 2026-10-15"}
+    metadata: {class: lost-update, learned_from: "internal testing 2026-10-15"}

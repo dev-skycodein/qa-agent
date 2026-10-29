@@ -7,6 +7,9 @@ Safety (aborts before starting anything):
   * every env override value that is a URL must be localhost
   * outbound keys (blank_keys) are exported as empty strings; they win over the project's .env
   * run_cmd must contain no remote host
+  * the port must be free: if something already listens there, nothing is started (a health check would pass on that process)
+  * the app and reset_cmd get only an allow-listed parent env (APP_ENV_ALLOW + profile env_allow) plus the target's own env;
+    the names of the dropped variables are printed (values never are)
 The command gets QA_BASE_URL (and QA_SINK_LOG). The app process tree is killed on exit.
 
 Extra profile keys:
@@ -19,10 +22,13 @@ Extra profile keys:
                Skipped with --no-reset. Without it the DB keeps rows from earlier runs (results depend on table size).
 """
 import argparse
+import http.client
+import ipaddress
 import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -36,6 +42,7 @@ from api import urlopen_local  # noqa: E402  (health check must not go through a
 LOCAL = ("localhost", "127.0.0.1", "::1")
 _URL_HOST = re.compile(r"[a-z][a-z0-9+.-]*://(?:[^/\s@]*@)?(\[[0-9a-f:]+\]|[^/\s:?#]+)", re.I)
 _HOST_PORT = re.compile(r"(?<![\w./@-])((?:[a-z0-9-]+\.)+[a-z]{2,24}):\d{2,5}\b", re.I)
+_IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
 _FILE_EXT = {"py", "js", "ts", "json", "yml", "yaml", "txt", "md", "sh", "cfg", "toml", "ini", "env", "lock", "db", "sql", "xml", "html"}
 _HOSTY_KEY = re.compile(r"HOST|SERVER|ENDPOINT|URI|URL|ADDR|DSN", re.I)
 _DOTTED = re.compile(r"(?:[a-z0-9-]+\.)+([a-z]{2,24})", re.I)
@@ -43,15 +50,26 @@ _OLD_DENY = ("mongodb+srv", ".mongodb.net", "amazonaws.com")
 
 
 def _is_local(host: str) -> bool:
+    """True only for "localhost", the IPv6 loopback, or an IP literal in 127.0.0.0/8 (parsed, not prefix-matched: a name such as
+    127.0.0.1.evil.com is NOT local). A "{placeholder}" or an empty host is treated as local: it is filled in later."""
     host = host.strip("[]").lower()
-    return host in LOCAL or host.startswith("127.") or host.startswith("{") or host == ""
+    if host in ("localhost", "::1", "") or host.startswith("{"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def remote_hosts(text: str) -> list:
-    """Hosts in a command line / env value that are not this machine: scheme://host URLs, dotted host:port pairs, and the old
-    denylist strings. A leaky allowlist beats a 3-string denylist, but it is still a heuristic: the real boundary is the sink."""
+    """Hosts in a command line / env value that are not this machine: scheme://host URLs, dotted host:port pairs, bare IPv4
+    literals, and the old denylist strings. A leaky allowlist beats a 3-string denylist, but it is still a heuristic: a
+    script given via `python -c` is not analysed, and the real boundary is the sink (see sink.py)."""
     found = [h for h in _URL_HOST.findall(text) if not _is_local(h)]
+    # bare host:port whose last label looks like a file extension is treated as a file reference (test_safe_run pins
+    # "app.py:8000" as not a host). Known gap: "evil.sh:8080" is not caught; scheme URLs (http://evil.sh) still are.
     found += [h for h in _HOST_PORT.findall(text) if h.rsplit(".", 1)[-1].lower() not in _FILE_EXT and not _is_local(h)]
+    found += [ip for ip in _IPV4.findall(text) if not _is_local(ip)]
     found += [d for d in _OLD_DENY if d in text]
     return sorted(set(found))
 
@@ -95,8 +113,41 @@ def check_safe(profile: dict) -> None:
             problems.append(f"reset_cmd mentions a remote host: {remote_hosts(profile['reset_cmd'])}")
     if reset_argv and remote_hosts(" ".join(map(str, reset_argv))):
         problems.append("reset_cmd_argv mentions a remote host")
+    if reset_argv and str(reset_argv[0]).lower().endswith((".cmd", ".bat")):
+        problems.append("reset_cmd_argv[0] is a .cmd/.bat script: Windows runs it through cmd.exe, so later arguments become shell text")
     if problems:
         sys.exit("safe_run REFUSED:\n  - " + "\n  - ".join(problems))
+
+
+# Parent variables the app and reset_cmd may inherit. Everything else (DATABASE_URL, AWS_*, OPENAI_API_KEY, GITHUB_TOKEN...) is
+# dropped. The profile can add names with "env_allow"; the target's own env_overrides and blank_keys are always applied.
+APP_ENV_ALLOW = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "HOME", "USERPROFILE", "HOMEDRIVE",
+                 "HOMEPATH", "TEMP", "TMP", "LANG", "LC_ALL",
+                 # launchers and Python need these to find their own installs and caches (found by the selftest: without APPDATA
+                 # "python -m uv" failed with "No module named uv")
+                 "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROCESSOR_ARCHITECTURE", "PYTHONHOME", "PYTHONPATH", "PYTHONUTF8",
+                 "PYTHONIOENCODING", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "UV_PYTHON", "UV_INDEX_URL", "UV_DEFAULT_INDEX")
+
+
+def scrub_env(parent, extra_allow=()) -> tuple:
+    """(allowed env, dropped names). Names are compared case-insensitively (Windows env names are)."""
+    allow = {n.upper() for n in (*APP_ENV_ALLOW, *extra_allow)}
+    kept = {k: v for k, v in parent.items() if k.upper() in allow}
+    dropped = sorted(k for k in parent if k.upper() not in allow)
+    return kept, dropped
+
+
+def port_in_use(port: int) -> bool:
+    """True if something already accepts connections on the port (IPv4 or IPv6 loopback)."""
+    for host, family in (("127.0.0.1", socket.AF_INET), ("::1", socket.AF_INET6)):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -128,6 +179,9 @@ def main():
     check_safe(profile)
 
     port = a.port or profile["port"]
+    if port_in_use(port):
+        sys.exit(f"safe_run REFUSED: port {port} already has a listener (another app, or a leftover server). "
+                 "Stop it or pick another port; nothing was started. A health check would have passed on that process.")
     profile_dir = os.path.dirname(os.path.abspath(a.profile))
     sink = None
     overrides = dict(profile["env_overrides"])
@@ -138,8 +192,13 @@ def main():
             for ph, real in sink.placeholders().items():
                 value = value.replace(ph, real)
             overrides[var] = value
-    env = {**os.environ, "PYTHONUTF8": "1", "PORT": str(port), **overrides, **{k: "" for k in profile["blank_keys"]}}
-    cmd_env = {**env, "QA_APP_DIR": profile["app_dir"]}
+    target_env = {"PYTHONUTF8": "1", "PORT": str(port), **overrides, **{k: "" for k in profile["blank_keys"]}}
+    # the app and reset_cmd get only the allow-listed parent env plus the target's own declared env
+    kept, dropped = scrub_env(os.environ, profile.get("env_allow") or [])
+    env = {**kept, **target_env}
+    print(f"[safe_run] app env: dropped {len(dropped)} parent variable(s), names only: {', '.join(dropped)}", flush=True)
+    # the engine command (not the app) keeps the full parent environment, as before
+    cmd_env = {**os.environ, **target_env, "QA_APP_DIR": profile["app_dir"]}
     if sink:
         cmd_env["QA_SINK_LOG"] = os.path.join(profile_dir, "sink.jsonl")
     if sink:
@@ -176,7 +235,8 @@ def main():
                             **({} if os.name == "nt" else {"start_new_session": True}))
     code = 1
     try:
-        health = base + profile.get("health_path", "/")
+        health_path = str(profile.get("health_path") or "/")
+        health = base + (health_path if health_path.startswith("/") else "/" + health_path)   # "health" -> "/health"
         deadline = time.time() + a.wait
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -186,8 +246,8 @@ def main():
                 break
             except urllib.error.HTTPError:
                 break  # server answered
-            except OSError:
-                time.sleep(1)
+            except (OSError, http.client.HTTPException):
+                time.sleep(1)     # not up yet, or it answered with something that is not HTTP yet: keep waiting until --wait
         else:
             sys.exit(f"[safe_run] app not healthy at {health} after {a.wait}s; see app.log")
         print(f"[safe_run] up at {base}", flush=True)

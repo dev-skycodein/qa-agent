@@ -62,6 +62,15 @@ Relations (kind: precondition -> violation; main false-positive risk):
                      DELETE it: GET must answer 404/410 (re-read once); a second DELETE must not 5xx; each child collection
                      must answer 404 or an empty list afterwards (medium when it still lists items).
                      FP: soft delete (200 with a deleted flag) looks like a leftover resource.
+  MR-FILTER-PARTITION  OPTIONAL. A boolean query param x: ?x=true and ?x=false must be disjoint and together equal the listing,
+                     also under one other filter (composition). Inclusion flags (include_*, with_*, show_*) are skipped:
+                     ?include_archived=true adds rows, so it is not a split. FP: a flag whose meaning is not a split.
+  MR-SEARCH-CASE     OPTIONAL. A text-search param (q, search, ...) with a word in its original, lower and upper case must find the
+                     same items. Medium only when the spec says case-insensitive; otherwise a low "verify". FP: undocumented
+                     collation or a search that is deliberately case-sensitive.
+  MR-BULK-ATOMIC     OPTIONAL. A bulk POST (array body) with one valid and one invalid item must be rejected AND leave the
+                     collection unchanged. Medium when the spec promises all-or-nothing, low "verify" otherwise. FP: APIs that apply
+                     partial batches by design.
 
 Trust: no relation applicable at all -> SKIPPED (skipped_no_spec). A relation with no applicable endpoint, an
 inconclusive check or an engine error -> DEGRADED. Write relations create data (POST) and run after the read relations,
@@ -75,6 +84,7 @@ qa knobs (all optional): SKIP (global, endpoints never touched), METAMORPHIC_SKI
 import json
 import math
 import re
+import time
 import urllib.parse
 from collections import Counter
 
@@ -117,6 +127,7 @@ CONTROL = set(SIZE_NAMES + OFFSET_NAMES + PAGE_NAMES + SORT_NAMES + ORDER_NAMES)
 TOTAL_NAMES = ("total", "count", "total_count", "totalCount", "total_items", "totalItems", "total_results", "totalResults")
 SHAPE_NAMES = ("items", "data", "results", "records", "rows", "list")
 NUMERIC_TEXT = re.compile(r"^-?\d+(\.\d+)?$")
+INCLUSION_FLAG = re.compile(r"^(include|with|show)(_|-|[A-Z]|$)")   # include_archived, includeDeleted: true ADDS rows to the default listing, so it is not a partition
 COUNT_NAME = re.compile(r"total|count", re.I)                       # a count field of a stats-like answer
 COUNT_EXCLUDE = re.compile(r"\b(ever|cumulative|since|historical|created|added)\b", re.I)   # counts that never go down
 SUBSTRING_WORDS = re.compile(r"substring|contain|partial|search|\blike\b|fuzzy|prefix", re.I)
@@ -464,12 +475,23 @@ def concrete_path(op, cols):
     return fill(op["path"], {p: col["sample"][0]["id"]})
 
 
+VOLATILE_READS = 3        # reads per path
+VOLATILE_GAP_S = 0.05     # 50 ms apart: longer than the 15.6 ms Windows clock tick, so a timestamp can change between reads
+
+
 def learn_volatile(ctx, paths):
+    """Learn the fields that change between re-reads of the same GET (timestamps, counters, tokens). Two back-to-back reads can
+    fall in the same clock tick and miss a timestamp, so VOLATILE_READS reads are taken VOLATILE_GAP_S apart and every later
+    read is compared with the first one: a field that differs in any of them is volatile."""
     for path in paths:
-        a = ctx.rq("GET", path)
-        b = ctx.rq("GET", path)
-        if a.ok and b.ok:
-            _learn(body_of(a), body_of(b), ctx.learned)
+        reads = []
+        for i in range(VOLATILE_READS):
+            if i:
+                time.sleep(VOLATILE_GAP_S)
+            reads.append(ctx.rq("GET", path))
+        ok = [r for r in reads if r.ok]
+        for other in ok[1:]:
+            _learn(body_of(ok[0]), body_of(other), ctx.learned)
     ctx.volatile |= ctx.learned
 
 
@@ -835,6 +857,12 @@ def filter_fn(ctx, col, field, contains):
     return fn
 
 
+def boolean_partition_params(query_params):
+    """Boolean query params that can split a listing: control names and inclusion flags (include_*, with_*, show_*) are left out."""
+    return [q["name"] for q in (query_params or [])
+            if (q.get("schema") or {}).get("type") == "boolean" and q["name"] not in CONTROL and not INCLUSION_FLAG.match(q["name"])]
+
+
 def partition_fn(ctx, col, name, base):
     """A boolean filter splits a listing in two: ?x=true and ?x=false must be disjoint and together equal the listing they filter
     (also under another filter: a bug that only shows when two filters are combined is the usual one)."""
@@ -960,10 +988,9 @@ def sort_fn(ctx, col, sort_name, field, order_name):
             raise Inconclusive(f"'{field}' has mixed types")
         if len(set(map(str, keys))) < 3:
             raise Inconclusive(f"'{field}' has fewer than 3 distinct values")
-        cmp_keys = keys
-        if all(isinstance(k, str) and NUMERIC_TEXT.match(k) for k in keys):
-            cmp_keys = [float(k) for k in keys]          # numeric text (no declared type): order it as the numbers it spells
-        asc, desc = _monotone(cmp_keys)
+        asc, desc = _monotone(keys)                      # text order first: a database that sorts numeric-looking strings as text is right
+        if not asc and not desc and all(isinstance(k, str) and NUMERIC_TEXT.match(k) for k in keys):
+            asc, desc = _monotone([float(k) for k in keys])   # numeric text with no declared type: numeric order is accepted too
         if not asc and not desc:
             return ("medium", f"{sort_name}={field} is not monotone: first keys {keys[:12]}")
         if asc and desc:
@@ -1098,9 +1125,9 @@ def put_fn(ctx, path, create_body, put_body, tpl, param):
     return fn
 
 
-def _child_state(ctx, path):
-    """(status, number of items) of a child collection read."""
-    r = ctx.rq("GET", path)
+def _child_state(ctx, path, role=None):
+    """(status, number of items) of a child collection read, as `role` (default: the default role)."""
+    r = ctx.rq("GET", path, role=role)
     if r.server_error or r.transport:
         return r.status, None
     if not r.ok:
@@ -1129,33 +1156,39 @@ def soft_deleted(body) -> bool:
     return False
 
 
+GONE_STATUS = (403, 404, 410)     # after a DELETE: 404/410 is gone; 403 means this role cannot see it, which is not a leftover either
+
+
 def delete_fn(ctx, path, create_body, tpl, param, children):
+    """Create an item (and one child under each documented child collection), DELETE it as its owner, then read it back as its
+    owner. A 200 that still shows the item is a finding (unless it says it is soft-deleted). Reads by the default role are not
+    used: a 403 from another role is not evidence that the resource remains."""
     def fn():
         rid = create(ctx, path, create_body)
         target = fill(tpl, {param: rid})
-        role = ctx.role_for(path)
+        role = ctx.role_for(path)                        # the role that created the item (create() records it)
         kids = []
         for ctpl, cbody in children:                     # one item under each documented child collection
             cpath = fill(ctpl, {param: rid})
             try:
                 create(ctx, cpath, cbody)
-                kids.append(cpath)
+                kids.append((cpath, ctx.role_for(cpath)))
             except Inconclusive:
                 pass
-        before = {c: _child_state(ctx, c) for c in kids}
+        before = {c: _child_state(ctx, c, crole) for c, crole in kids}
         d1 = ctx.rq("DELETE", target, role=role)
         if not d1.ok:
             raise Inconclusive(f"DELETE -> {d1.status}")
-        g = ctx.rq("GET", target)
-        if g.status not in (404, 410):
-            g = ctx.rq("GET", target)                    # one re-read: eventual consistency is not a leftover
-            if g.status not in (404, 410) and not (g.ok and soft_deleted(g.json)):
+        g = ctx.rq("GET", target, role=role)
+        if g.status not in GONE_STATUS:
+            g = ctx.rq("GET", target, role=role)         # one re-read: eventual consistency is not a leftover
+            if g.status not in GONE_STATUS and not (g.ok and soft_deleted(g.json)):
                 return ("high", f"DELETE answered {d1.status} but GET {target} still answers {g.status}: the resource remains")
-        for c in kids:
+        for c, crole in kids:
             n0 = before[c][1]
             if not n0:
                 continue
-            status, n = _child_state(ctx, c)
+            status, n = _child_state(ctx, c, crole)
             if n is None:
                 return ("medium", f"after DELETE {target}, GET {c} -> {status}: a server error for the children of a deleted item")
             if n:
@@ -1320,8 +1353,7 @@ def build_plan(ctx, ops, cols, reads, stat_fields):
         for n in filt_names:
             contains = bool(SUBSTRING_WORDS.search(declared_text(col["op"], n)))
             plan["MR-FILTER-SUBSET"].append((f"{ek} ?{n}=", ek, filter_fn(ctx, col, n, contains)))
-        bools = [q["name"] for q in (col["op"].get("query_params") or [])
-                 if (q.get("schema") or {}).get("type") == "boolean" and q["name"] not in CONTROL]
+        bools = boolean_partition_params(col["op"].get("query_params"))
         base_filters = [{}]
         if sample and filt_names and sample[0].get(filt_names[0]) is not None:
             base_filters.append({filt_names[0]: norm(sample[0].get(filt_names[0]))})
@@ -1442,7 +1474,7 @@ def run(api, spec_doc, qa) -> dict:
         reads = [(op, p) for op, p in reads if p is not None]
         learn_volatile(ctx, [p for _, p in reads])
         if ctx.learned:
-            ctx.notes.append("volatile fields learned from two identical reads (ignored by every comparison; "
+            ctx.notes.append("volatile fields learned from re-reads of the same GET (ignored by every comparison; "
                              f"override with qa.VOLATILE_FIELDS): {sorted(ctx.learned)}")
         snapshot_counts(ctx, ops, cols, stat_fields)
         plan = build_plan(ctx, ops, cols, reads, stat_fields)

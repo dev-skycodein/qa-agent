@@ -380,7 +380,8 @@ class Ctx:
 
     def role_for(self, ep):
         """The first role (normal users first) the server does not refuse (401/403) for this create endpoint.
-        Sent with an empty body: a validation error still proves the role may reach it, and nothing is written."""
+        Sent with an empty body. A validation error (4xx other than 401/403) proves the role may reach it. A 2xx answer means
+        the empty POST was accepted, so it may have created a record, and the engine does not remove it."""
         if "{" in ep["path"] or len(self.roles) < 2:
             return self.role
         k = key(ep)
@@ -613,7 +614,10 @@ class Ctx:
             delta = after[field] - before[field]
             direction = rule.get("direction", "decrease")
             expected = ((-amount if direction == "decrease" else amount) if resp.ok else 0)
-            if delta != expected:
+            # Money and counters are floats: 100.1 - 0.1 is not exactly 100.0. Compare with a relative tolerance of 1e-9 and an
+            # absolute floor of 1e-9 times the largest magnitude involved (at least 1e-9), so rounding is not a finding.
+            scale = max(abs(before[field]), abs(after[field]), abs(amount), 1.0)
+            if not math.isclose(delta, expected, rel_tol=1e-9, abs_tol=1e-9 * scale):
                 add_rule(f"{field} changed by {delta} (before {before[field]}, after {after[field]}); the act was "
                          f"{'accepted' if resp.ok else 'rejected'} with |{dfield}|={amount}, so {field} should change by {expected}")
         elif kind == "non_negative":

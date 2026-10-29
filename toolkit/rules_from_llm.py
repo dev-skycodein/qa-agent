@@ -3,7 +3,7 @@
 mechanical check. The LLM never writes code; it writes data that logic_engine.py executes with read-back.
 
   python toolkit/rules_from_llm.py --openapi path/to/openapi.json [--base-spec qa-spec.py] [--out qa-spec.llm.py]
-         [--provider skycodein] [--max-rules 5] [--dry-run]
+         --provider NAME --key-env VAR --api-url URL --model MODEL [--max-rules 5] [--dry-run]
 
 Why this design (tree of thoughts)
   (A) The LLM writes the whole qa-spec.py (toolkit/synthesize.py): flexible, but one syntax slip or invented endpoint breaks the file,
@@ -15,7 +15,9 @@ Why this design (tree of thoughts)
 Honest limits: the rule language is narrow (no arithmetic across two objects); a rule that is wrong for a legal API produces a false
 positive at severity high (declared rules are trusted), so rules are measured on a clean variant before they are believed;
 the digest is cut to fit a small context, so large APIs are only partly shown (the output says how many operations).
-Requires SKY_CODEIN_KEY (environment or .env) for the default provider.
+The LLM helper is OPTIONAL and OFF by default: the core engines never import this module. Calling it needs an explicit opt-in
+(--provider, --key-env, --api-url or QA_LLM_API_URL, --model or QA_LLM_MODEL); without one it stops before any network call.
+The dry run (--dry-run) makes no network call and needs no opt-in.
 """
 import argparse
 import json
@@ -113,7 +115,7 @@ def call_llm(system, user, cfg, key, tries=3, idle_timeout=100, sleep=time.sleep
     if cfg.get("json_mode"):
         payload["response_format"] = {"type": "json_object"}
     req = urllib.request.Request(cfg["api_url"], data=json.dumps(payload).encode(),
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "qa-toolkit/0.1"})
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "qa-testing/0.1"})
     host = urllib.parse.urlparse(cfg["api_url"])
     if host.scheme == "http" and host.hostname not in ("127.0.0.1", "localhost", "::1") \
             and os.environ.get("QA_ALLOW_PLAINTEXT_PROVIDER") != "1":
@@ -304,9 +306,18 @@ def render(base_text, kept, meta):
     return base_text.rstrip("\n") + header + body        # the header holds only our own values (model name, counts), never LLM text
 
 
-def propose(spec, provider="skycodein", max_rules=5, caller=None, key=None):
-    """-> {'kept': [...], 'dropped': [(name, why)], 'raw': text, 'usage': {...}, 'shown': n, 'total': n}"""
-    cfg = S.provider_settings(provider)
+def propose(spec, provider=None, max_rules=5, caller=None, key=None, key_env=None, api_url=None, model=None):
+    """-> {'kept': [...], 'dropped': [(name, why)], 'raw': text, 'usage': {...}, 'shown': n, 'total': n}
+
+    A network call (caller is None) needs an explicit opt-in: provider, key_env, api_url and model (see synthesize.provider_settings);
+    the key is read from the environment variable named by key_env unless key is given. `caller` replaces the network (tests)."""
+    if caller is None:
+        cfg = S.provider_settings(provider, api_url, model, None, key_env)     # refuses before any network use
+        key = key or os.environ.get(cfg["key_env"])
+        if not key:
+            raise SystemExit(f"Set {cfg['key_env']} in the environment or the .env file (root of qa-testing); --key-env names it")
+    else:
+        cfg = {"context_chars": S.PROVIDERS.get(provider or "", {}).get("context_chars"), "model": model or "", "api_url": api_url or ""}
     cfg["json_mode"] = provider == "skycodein"
     system, user, shown, total = build_prompt(spec, max_rules, DIGEST_BUDGET if cfg["context_chars"] else 20000)
     S.check_context(system, user, cfg["context_chars"])
@@ -327,7 +338,11 @@ def main():
     p.add_argument("--openapi", required=True)
     p.add_argument("--base-spec", help="existing qa-spec.py; the output is this file plus the proposed rules")
     p.add_argument("--out", default="qa-spec.llm.py")
-    p.add_argument("--provider", choices=sorted(S.PROVIDERS), default="skycodein")
+    p.add_argument("--provider", choices=sorted(S.PROVIDERS), default=None,
+                   help="REQUIRED to opt in (no default); see synthesize.py")
+    p.add_argument("--key-env", default=None, help="REQUIRED to opt in: name of the environment variable holding the API key")
+    p.add_argument("--api-url", default=None, help="REQUIRED to opt in unless QA_LLM_API_URL is set")
+    p.add_argument("--model", default=None, help="REQUIRED to opt in unless QA_LLM_MODEL is set")
     p.add_argument("--max-rules", type=int, default=5)
     p.add_argument("--dry-run", action="store_true", help="print the prompt size and stop")
     a = p.parse_args()
@@ -342,10 +357,7 @@ def main():
     print(f"prompt: {len(system) + len(user)} characters ({shown}/{total} operations shown)", file=sys.stderr)
     if a.dry_run:
         return
-    key = os.environ.get(S.PROVIDERS[a.provider]["key_env"])
-    if not key:
-        raise SystemExit(f"Set {S.PROVIDERS[a.provider]['key_env']} in the .env file (root of the repository)")
-    res = propose(spec, a.provider, a.max_rules, key=key)
+    res = propose(spec, a.provider, a.max_rules, key_env=a.key_env, api_url=a.api_url, model=a.model)     # refuses without opt-in
     for name, why in res["dropped"]:
         print(f"  DROPPED {name}: {why}", file=sys.stderr)
     print(f"{len(res['kept'])} rule(s) kept, {len(res['dropped'])} dropped; tokens {res['usage']}", file=sys.stderr)

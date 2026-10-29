@@ -7,12 +7,13 @@ qa-spec.py:
 `ctx = fresh_state(api)` per scenario. A crash that is not an AssertionError is reported as a note, not as a finding.
 """
 import trust
+from scenarios_lib import SetupFailed
 
 
 def run(api, spec_doc, qa) -> dict:
     fresh = getattr(qa, "fresh_state", lambda api: {})
     findings, notes = [], []
-    crashed = 0
+    crashed = setup_failed = 0
     scenarios = getattr(qa, "SCENARIOS", [])
     if not scenarios:
         notes.append("no SCENARIOS in qa-spec.py (write one per access-control / lifecycle rule: blocked user, revoked token, single-use link)")
@@ -22,6 +23,10 @@ def run(api, spec_doc, qa) -> dict:
             problem = sc["run"](api, ctx)
         except AssertionError as exc:
             problem = str(exc) or "assertion failed"
+        except SetupFailed as exc:
+            notes.append(f"{sc['name']}: setup failed, its check never ran ({exc})")
+            setup_failed += 1
+            continue
         except Exception as exc:
             notes.append(f"{sc['name']}: scenario crashed ({type(exc).__name__}: {exc})")
             crashed += 1
@@ -35,4 +40,6 @@ def run(api, spec_doc, qa) -> dict:
         return trust.mark(res, trust.ERRORED, f"all {crashed} scenario(s) crashed")
     if crashed:
         return trust.mark(res, trust.DEGRADED, f"{crashed} of {len(scenarios)} scenario(s) crashed")
+    if setup_failed:
+        return trust.mark(res, trust.SETUP_FAILED, f"setup failed for {setup_failed} of {len(scenarios)} scenario(s): their checks never ran")
     return trust.mark(res, trust.RAN_OK)

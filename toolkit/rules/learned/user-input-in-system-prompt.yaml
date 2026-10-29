@@ -15,4 +15,4 @@ rules:
       - metavariable-regex:
           metavariable: $F
           regex: (?i).*(system|context|prompt|note).*
-    metadata: {class: prompt-injection, learned_from: "private QA run 2026-10-15"}
+    metadata: {class: prompt-injection, learned_from: "internal testing 2026-10-15"}

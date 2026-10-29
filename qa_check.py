@@ -1,21 +1,27 @@
-"""One-command health check for the QA toolkit. Run it in a normal terminal:
+"""One-command health check for the QA toolkit. Run it in a normal terminal (outside Claude):
 
   python qa_check.py              # interactive menu
-  python qa_check.py --quick      # preflight + safety + trust tests + unit tests + selftest (~10 min)
-  python qa_check.py --full       # quick + selftest x3 consistency + clean control (longer)
+  python qa_check.py --quick      # preflight + safety + trust tests + selftest (~2-3 min)
+  python qa_check.py --full       # quick + selftest x3 consistency + a seeded benchmark (needs its own data) (~30+ min, needs Mongo running)
 
 Every step prints PASS / FAIL / SKIP / WARN with a reason. Full output of every step goes to
 logs/qa-check-<time>.log. Exit code 0 = no FAIL. Stdlib only, so it runs on the system python.
 """
 import datetime
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
+# Optional local targets: set these env vars to enable the SKIP-by-default checks; unset = SKIP with reason.
+SEEDED_BENCH = Path(os.environ.get("QA_SEEDED_BENCH", "unset/seeded-benchmark.json"))
+EXTRA_DIR = Path(os.environ.get("QA_EXTRA_TARGET_DIR", "unset/extra-target"))
+JUICE_DIR = Path(os.environ.get("QA_JUICE_DIR", "unset/juice-shop"))
 
 PASS, FAIL, SKIP, WARN = "PASS", "FAIL", "SKIP", "WARN"
 
@@ -59,8 +65,42 @@ def step_versions(log_fh):
     if not uv_ok:
         return Result("python + uv + node", FAIL, "python -m uv not runnable; engines need it")
     if not node_ok:
-        return Result("python + uv + node", WARN, "node not on PATH (needed only for the Node validators)")
+        return Result("python + uv + node", WARN, "node not on PATH (only lms/juice need it)")
     return Result("python + uv + node", PASS, "; ".join(notes) + ", python -m uv, node found")
+
+
+def step_paths(log_fh):
+    problems = []
+    if not (ROOT / "toolkit" / "engine" / "selftest.py").exists():
+        problems.append("toolkit/engine missing (wrong folder?)")
+    if not SEEDED_BENCH.exists():
+        return Result("hardcoded target paths", WARN,
+                      f"seeded benchmark data not found at {SEEDED_BENCH} (only --full needs it)")
+    try:
+        seeds = json.loads(SEEDED_BENCH.read_text(encoding="utf-8"))
+        repo = Path(seeds.get("repo", ""))
+        if not repo.exists():
+            problems.append(f"seeds.json repo path missing: {repo}")
+    except Exception as e:
+        problems.append(f"seeds.json unreadable: {e}")
+    if problems:
+        return Result("hardcoded target paths", FAIL, "; ".join(problems))
+    return Result("hardcoded target paths", PASS, "toolkit + seeded benchmark data resolve")
+
+
+def step_port(name, port, needed_for):
+    def check(log_fh):
+        s = socket.socket()
+        s.settimeout(1)
+        try:
+            s.connect(("127.0.0.1", port))
+            return Result(name, PASS, f"port {port} open")
+        except OSError:
+            return Result(name, SKIP, f"port {port} closed; start it only for {needed_for}")
+        finally:
+            s.close()
+    check.__name__ = "port_" + str(port)
+    return check
 
 
 def step_safety(log_fh):
@@ -91,15 +131,11 @@ def step_trust(log_fh):
 
 
 def step_console(log_fh):
-    for name in ("test_console.py", "test_target_guard.py"):
+    for name in ("test_console.py", "test_mutate.py", "test_target_guard.py"):
         code, out = run_cmd([sys.executable, str(ROOT / "tests" / name)], ROOT, 300, log_fh)
         if code != 0:
-            return Result("console tests", FAIL, f"{name}: " + ("timed out" if code is None else tail(out, 3).replace("\n", " | ")), out)
-    if code is None:
-        return Result("console tests", FAIL, "timed out", out)
-    if code != 0:
-        return Result("console tests", FAIL, tail(out, 3).replace("\n", " | "), out)
-    return Result("console tests", PASS, "diff / fingerprint / reset / read-only server safety green", out)
+            return Result("console + mutation tests", FAIL, f"{name}: " + ("timed out" if code is None else tail(out, 3).replace("\n", " | ")), out)
+    return Result("console + mutation tests", PASS, "diff / fingerprint / reset / read-only server safety and mutation judging green", out)
 
 
 def step_unit_tests(log_fh):
@@ -112,8 +148,8 @@ def step_unit_tests(log_fh):
         path = ROOT / name if name.startswith("toolkit/") else ROOT / "toolkit" / "engine" / name
         code, out = run_cmd([sys.executable, str(path)], ROOT, 300, log_fh)
         if code != 0:
-            return Result("engine unit tests", FAIL, f"{name}: " + ("timed out" if code is None else tail(out, 2).replace("\n", " | ")), out)
-    return Result("engine unit tests", PASS, "stats, miner, authz, auth, schema, differential and workflow tests green")
+            return Result("stats + miner + authz tests", FAIL, f"{name}: " + ("timed out" if code is None else tail(out, 2).replace("\n", " | ")), out)
+    return Result("stats + miner + authz tests", PASS, "Wilson/bounds, mined-invariant and authz-oracle tests green")
 
 
 def step_clean_control(log_fh):
@@ -142,8 +178,36 @@ def step_selftest_repeat(k):
     return check
 
 
-QUICK = [step_versions, step_safety, step_trust, step_console, step_unit_tests, step_selftest]
-FULL = QUICK + [step_selftest_repeat(3), step_clean_control]
+def step_bench(log_fh):
+    if not SEEDED_BENCH.exists():
+        return Result("seeded benchmark", SKIP, "seeds.json not found")
+    code, out = run_cmd([sys.executable, str(ROOT / "benchmarks" / "bench.py"), str(SEEDED_BENCH), "--checks", "engines"],
+                        ROOT, 4 * 3600, log_fh)
+    if code is None:
+        return Result("seeded benchmark", FAIL, "timed out", out)
+    last = tail(out, 1)
+    if code == 0:
+        return Result("seeded benchmark", PASS, last, out)
+    return Result("seeded benchmark", FAIL, last, out)
+
+
+def step_lms_present(log_fh):
+    if not EXTRA_DIR.exists():
+        return Result("extra target clone", SKIP, f"not at {EXTRA_DIR}")
+    return Result("extra target clone", PASS, "present (its own tests are not run here)")
+
+
+def step_juice_present(log_fh):
+    if not JUICE_DIR.exists():
+        return Result("juice-shop clone", SKIP, f"not at {JUICE_DIR}")
+    built = (JUICE_DIR / "node_modules").exists()
+    return Result("juice-shop clone", WARN if not built else PASS,
+                  "present, node_modules " + ("found" if built else "missing (npm install not run)"))
+
+
+QUICK = [step_versions, step_paths, step_port("mongo (benchmark)", 27017, "--full bench"),
+         step_port("postgres (extra target)", 5433, "extra target runs"), step_safety, step_trust, step_console, step_unit_tests, step_selftest]
+FULL = QUICK + [step_selftest_repeat(3), step_clean_control, step_bench, step_lms_present, step_juice_present]
 
 
 def execute(steps, label):
@@ -169,9 +233,9 @@ def execute(steps, label):
 
 def menu():
     options = {
-        "1": ("Quick check (preflight, safety, tests, selftest)", QUICK),
-        "2": ("Full check (quick + selftest x3 + clean control, long)", FULL),
-        "3": ("Preflight only (tools)", QUICK[:1]),
+        "1": ("Quick check (preflight + safety + selftest)", QUICK),
+        "2": ("Full check (quick + seeded benchmark, long)", FULL),
+        "3": ("Preflight only (tools, paths, ports)", QUICK[:3]),
         "4": ("Safety tests only", [step_safety]),
         "5": ("Engine selftest only", [step_selftest]),
         "q": None,

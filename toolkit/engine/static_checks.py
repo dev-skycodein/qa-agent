@@ -8,11 +8,17 @@ Checks (all candidates; the dynamic engines / a PoC decide):
                       Reports the space, and the number of rows at which a collision is already 50 % likely (birthday bound).
   ENUM-CAST           request input is cast to a Prisma / TS enum type (`x as TicketType`) in a handler without validation:
                       invalid values reach the ORM and become 500s.
-  ERROR-ECHO          catch block returns the raw exception message / stack to the client.
-  MASS-ASSIGN-SPREAD  the request body (or a spread of it) is passed straight into an ORM create / update.
-  ROUTE-NO-AUTH       Next.js route handler that never touches a session / token helper (review: public on purpose?).
+  ERROR-ECHO          catch block returns the raw exception message / stack to the client. JS/TS handlers only; a Python
+                      `str(e)` in an error response is not checked. Misses `(e as Error).message`.
+  MASS-ASSIGN-SPREAD  the request body (or a spread of it) is passed straight into an ORM create / update. Reported even when
+                      the body was validated first (zod, parse): a validated body is still a candidate, so check by hand.
+  ROUTE-NO-AUTH       Next.js App Router route.ts handler that never touches a session / token helper (review: public on
+                      purpose?). Pages-router handlers are not checked.
   RANDOM-TOKEN        Math.random / random.random used to build tokens, codes, passwords, ids that look security relevant.
-Heuristic and regex based on purpose: no build, no dependencies, JS/TS + Python + Prisma.
+                      The name match is a substring, so `statusCode` matches `code`: check by hand.
+Heuristic and regex based on purpose: no build, no dependencies. UNIQUE-FROM-RANDOM reads JS/TS and Python files; RANDOM-TOKEN
+reads Python files everywhere and JS/TS in handler files; ENUM-CAST, ERROR-ECHO, MASS-ASSIGN-SPREAD and ROUTE-NO-AUTH read JS/TS
+handler files only; Prisma schemas are read for @unique and enums.
 """
 import argparse
 import math
@@ -58,8 +64,45 @@ def unique_fields(root: Path) -> dict[str, list[str]]:
     return out
 
 
-def function_bodies(root: Path) -> dict[str, tuple[str, str, int]]:
-    """{name: (body_text, file, line)} for JS/TS functions and Python defs (body = next ~30 lines / until matching brace)."""
+MAX_BODY = 20000          # characters: a function body longer than this is not read (reported as undetermined)
+
+
+def _brace_body(t: str, open_idx: int) -> str | None:
+    """Text between the `{` at open_idx and its matching `}`. None when the braces do not close within MAX_BODY."""
+    depth = 0
+    for i in range(open_idx, min(len(t), open_idx + MAX_BODY)):
+        c = t[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return t[open_idx + 1:i]
+    return None
+
+
+def _indent_body(t: str, def_idx: int, colon_end: int) -> str:
+    """Python def: the rest of the def line plus every following line indented deeper than the def line (blanks kept)."""
+    line_start = t.rfind("\n", 0, def_idx) + 1
+    base = len(t[line_start:def_idx])
+    eol = t.find("\n", colon_end)
+    if eol < 0:
+        return t[colon_end:]
+    out = [t[colon_end:eol]]
+    for line in t[eol + 1:eol + 1 + MAX_BODY].split("\n"):
+        if line.strip() == "":
+            out.append(line)
+            continue
+        if len(line) - len(line.lstrip(" \t")) <= base:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def function_bodies(root: Path) -> dict[str, tuple[str | None, str, int]]:
+    """{name: (body_text or None, file, line)}. The body is bounded to the function itself: the matching braces for JS/TS
+    block bodies, the expression up to `;` or the end of the line for arrow expressions, the indented lines for Python defs.
+    None when the body cannot be determined (the caller then reports nothing for that function)."""
     out = {}
     for p in files(root):
         if p.suffix == ".prisma":
@@ -67,34 +110,56 @@ def function_bodies(root: Path) -> dict[str, tuple[str, str, int]]:
         t = p.read_text(encoding="utf-8", errors="replace")
         for m in re.finditer(r"(?:function\s+(\w+)\s*\([^)]*\)[^{]*\{)|(?:(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)[^=]*=>\s*\{?)|(?:def\s+(\w+)\s*\([^)]*\)[^:]*:)", t):
             name = m.group(1) or m.group(2) or m.group(3)
-            out.setdefault(name, (t[m.end():m.end() + 900], rel(p, root), line_of(t, m.start())))
+            if m.group(3) is not None:
+                body = _indent_body(t, m.start(), m.end())
+            elif t[m.end() - 1] == "{":
+                body = _brace_body(t, m.end() - 1)
+            else:
+                eol = t.find("\n", m.end())
+                body = t[m.end():eol if eol >= 0 else len(t)].split(";")[0]
+            out.setdefault(name, (body, rel(p, root), line_of(t, m.start())))
     return out
 
 
-def random_space(body: str) -> tuple[float, str] | None:
-    """Estimated number of distinct values a generator body can produce (None = not random / unknown)."""
-    best = None
+RANDOM_CALL = re.compile(r"Math\.random\(\)|random\.random\(\)|random\.(?:randint|randrange|choices?)\(")
 
-    def consider(space, why):
-        nonlocal best
-        if space > 1 and (best is None or space < best[0]):
-            best = (float(space), why)
+
+def random_space(body: str | None) -> tuple[float | None, str] | None:
+    """(space, why) for one generator body.
+
+    None: the body has no random call (or is undetermined). space None: there is a random call whose size this check cannot
+    read (for example random.random() or toString(16)), so nothing can be estimated. Otherwise space is the PRODUCT of the
+    sizes of the independent random terms: an upper bound on the distinct values the body can return (a value built from two
+    random parts has at most the product of their spaces, so the minimum would under-count the space)."""
+    if not body:
+        return None
+    calls = len(RANDOM_CALL.findall(body))
+    if calls == 0:
+        return None
+    sizes, whys = [], []
+
+    def take(size, why):
+        sizes.append(max(int(size), 1))
+        whys.append(why)
 
     for m in re.finditer(r"Math\.random\(\)\s*\*\s*(\d[\d_]*)", body):
-        consider(int(m.group(1).replace("_", "")), f"Math.random()*{m.group(1)}")
+        take(m.group(1).replace("_", ""), f"Math.random()*{m.group(1)}")
     for m in re.finditer(r"randint\(\s*(\d+)\s*,\s*(\d+)\s*\)", body):
-        consider(int(m.group(2)) - int(m.group(1)) + 1, f"randint({m.group(1)}, {m.group(2)})")
+        take(int(m.group(2)) - int(m.group(1)) + 1, f"randint({m.group(1)}, {m.group(2)})")
     for m in re.finditer(r"random\.randrange\(\s*(\d+)\s*(?:,\s*(\d+))?\s*\)", body):
         lo, hi = (0, int(m.group(1))) if m.group(2) is None else (int(m.group(1)), int(m.group(2)))
-        consider(hi - lo, m.group(0))
+        take(hi - lo, m.group(0))
     for m in re.finditer(r"Math\.random\(\)\.toString\(36\)\.(?:slice|substring|substr)\(\s*(\d+)\s*(?:,\s*(\d+))?\s*\)", body):
         n = (int(m.group(2)) - int(m.group(1))) if m.group(2) else 8
-        consider(36 ** max(n, 1), f"toString(36) x {n} chars")
+        take(36 ** max(n, 1), f"toString(36) x {n} chars")
     for m in re.finditer(r"random\.choices?\([^)]*k\s*=\s*(\d+)", body):
-        consider(36 ** int(m.group(1)), f"random.choices k={m.group(1)}")
-    if best is None and re.search(r"Math\.random\(\)|random\.random\(\)", body):
-        return (1e6, "Math.random() (space unknown, assumed small)")
-    return best
+        take(36 ** int(m.group(1)), f"random.choices k={m.group(1)}")
+    if len(sizes) < calls:
+        return (None, f"{calls - len(sizes)} random call(s) of unknown size")
+    space = 1.0
+    for s in sizes:
+        space *= s
+    return (space, " * ".join(whys))
 
 
 def check_unique_random(root: Path) -> list[dict]:
@@ -114,9 +179,16 @@ def check_unique_random(root: Path) -> list[dict]:
                     continue
                 body, fpath, fline = funcs[fn]
                 sp = random_space(body)
-                if not sp:
+                if sp is None:
                     continue
                 space, why = sp
+                if space is None:
+                    # A random source whose size this check cannot read: a LOW note to confirm by hand, never a High.
+                    findings.append({
+                        "kind": "UNIQUE-FROM-RANDOM", "severity": "low", "file": f"{rel(p, root)}:{line_of(t, m.start())}",
+                        "detail": f"unique column `{field}` ({where[0]}) is filled by {fn}() ({fpath}:{fline}), which uses a random "
+                                  f"source of unknown size ({why}); the collision risk cannot be estimated. Check the value space by hand."})
+                    continue
                 scoped = bool(re.search(r"getFullYear|strftime|\.year\b|toISOString\(\)\.slice", body))
                 n50 = 1.1774 * math.sqrt(space)
                 sev = "high" if n50 < 10_000 else "medium" if n50 < 1_000_000 else "low"
