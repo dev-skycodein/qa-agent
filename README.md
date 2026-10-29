@@ -4,7 +4,7 @@
 
 It is a locksmith that tests the doors of your own building, and then writes a report with proof for every door it opened. It is useful, but it does not promise that every door is locked.
 
-> **Status: early release (v0.2.0).** Tested on Windows 10 with Python 3.12 only. Use it on a local copy of your API, never on production.
+> **Status: early release (v0.2.0).** This project is about 20 days old and still in progress. Tested on Windows 10 with Python 3.12 only. Use it on a local copy of your API, never on production. Check back later for updates.
 
 ---
 
@@ -101,7 +101,7 @@ If you run it headless (`claude -p`), the `Skill` tool must be in the allowed li
 | `fp-check` | Checks whether a suspected bug is real, with a true or false positive verdict and evidence | Nothing extra |
 | `property-based-testing` | Writes and reviews property-based tests (Hypothesis, fast-check, and others) | The test framework of your language |
 | `sarif-parsing` | Reads, merges and de-duplicates SARIF files from scanners. Does not run scans | A SARIF file |
-| `semgrep` | Runs a Semgrep scan with a plan you approve first | `semgrep` installed; its run script is bash, so on Windows it needs Git Bash or WSL. **Not tested on Windows** |
+| `semgrep` | Runs a Semgrep scan with a plan you approve first | `semgrep` installed; its run script is bash, so on Windows it needs Git Bash or WSL |
 | `security-audit` | Security review of code, APIs and services, with validators | On Windows the validators need WSL and Node 24. See `docs/USING.md` |
 | `sharp-edges` | Finds error-prone APIs and unsafe defaults in designs and configuration | Nothing extra |
 | `supply-chain-risk-auditor` | Checks dependencies for known advisories, abandoned packages and install scripts | Your lockfile |
