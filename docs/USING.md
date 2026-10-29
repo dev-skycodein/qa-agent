@@ -99,6 +99,17 @@ Open `../my-api/qa-results/engines.md` (readable) or `engines.json` (for scripts
 - In the same run, the engines found 2 real issues out of 26 (an error body that leaked configuration text, and a login timing difference). The other real issues were found by reading the code, not by the engines. Expect the engines to need a tuned spec before they find much.
 - The author tested it on Windows 10. Other systems are not tested.
 
+## Full bug hunt with Claude Code (`/qa-hunt`)
+
+The plugin adds the command `/qa-toolkit:qa-hunt`. It runs the detect, map, invariants, scan, generic engines, PoC and report steps on a project.
+
+- **Interactive (recommended):** start Claude Code with `claude --plugin-dir <repo>/toolkit`, then type `/qa-toolkit:qa-hunt <path-to-your-project>`.
+- **Headless (`claude -p`):** the `Skill` tool must be in the allowed list, or the command is not found. Example:
+  `claude -p "/qa-toolkit:qa-hunt <path>" --plugin-dir <repo>/toolkit --allowedTools Skill Read Grep Glob Bash Write Edit Agent --max-budget-usd 5`
+  Without `Skill` in the list, Claude reads the command text and does a manual review instead. That is not the toolkit's engine run.
+- Check the result in `<project>/qa-report/`: `engines.md` says which engine ran, which degraded and which was skipped, and `trust.json` gives the verdict. A `PARTIAL` verdict means some checks did not run.
+- The `scan` step uses `scripts/scan.ps1`, which is Windows PowerShell only. The engines need Python 3.12 (see Dependencies in the README).
+
 ## Source-code review (optional)
 `toolkit/skills/security-audit/` is Cloudflare's `security-audit` skill (MIT, see `NOTICE.md`). It reviews source code, not a running API. Our additions are a Windows note in `SKILL.md` and `validate-wsl.ps1`. The validators are unchanged.
 
