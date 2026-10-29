@@ -29,16 +29,7 @@ It is a locksmith that tests the doors of your own building, and then writes a r
 - It finds only what its spec and engines can reach. Business rules that are stated only in prose are usually missed.
 - It does not test your frontend, your production system, or your infrastructure.
 
-**Measured numbers (honest):**
-
-| Test | Result |
-|---|---|
-| Four new APIs, 10 planted bugs each, spec written blind, no tuning | 3 of 40 found (95% interval 2.6% to 19.9%) |
-| Same, after tuning the spec on a clean copy | 13 of 40 found (95% interval 20.1% to 48.0%) |
-| Immich photo app v3.0.0, blind spec, known access bugs | 0 of 4 found |
-| Our own demo app (bugs we planted on purpose) | Most planted bugs found. This is not a recall figure |
-
-One run, one seed. Repeat important runs with `--seed`.
+A finding is a lead to reproduce, and a run with no findings is not proof that an API is safe. Repeat important runs with `--seed`.
 
 ---
 
