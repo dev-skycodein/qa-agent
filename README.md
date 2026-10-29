@@ -1,39 +1,111 @@
-# QA toolkit
+# QA Toolkit
 
-A toolkit that finds bugs in a **running** HTTP/JSON API. You give it your OpenAPI file and a small spec that describes your users and routes. It logs in as those users, sends requests to a local copy of your API, and reports each finding with the request and response that show it.
+**Finds bugs in a running web API by logging in as real users and trying what they should not be allowed to do.**
 
-It is a measurement instrument, not an oracle. A finding is a lead to reproduce. "No findings" does not mean the API is correct.
+It is a locksmith that tests the doors of your own building, and then writes a report with proof for every door it opened. It is useful, but it does not promise that every door is locked.
 
-## What is in the box
+> **Status: early release (v0.2.0).** Tested on Windows 10 with Python 3.12 only. Use it on a local copy of your API, never on production.
 
-| Path | What it is |
+---
+
+## What it does, in plain words
+
+1. You describe your API: the OpenAPI file, plus a small spec file that lists your test users (for example a buyer, a seller and an admin) and which endpoints are public or admin-only.
+2. The toolkit starts your API on your own computer.
+3. It logs in as each test user and sends requests: other users' data, missing logins, odd input, repeated and parallel requests.
+4. For each problem it finds, it writes the request, the response and the reason. You check it yourself before you report it.
+
+## What it can find
+
+- One user seeing or changing another user's data (access control).
+- Endpoints that work without a login, or that a normal user can use although only admins should.
+- Crashes and error pages on strange input, and error text that leaks internals.
+- Data that leaks in responses or outgoing emails.
+- Some order and stock problems: double cancel, overselling under parallel requests.
+
+## What it cannot do
+
+- It cannot prove that your API is secure. "No findings" means "nothing found by these checks", not "no bugs".
+- It finds only what its spec and engines can reach. Business rules that are stated only in prose are usually missed.
+- It does not test your frontend, your production system, or your infrastructure.
+
+**Measured numbers (honest):**
+
+| Test | Result |
 |---|---|
-| `toolkit/engine/` | The engines. Core: `authz`, `negative`, `stateful`, `race`, `scenario`, `static`. Experimental (no measured recall yet): `schema`, `auth`, `exposure`, `differential`, `workflow`, `metamorphic`, `logic` |
-| `toolkit/engine/run.py` | Runs the engines against a spec. `--preflight` checks the spec without sending attack traffic |
-| `toolkit/engine/safe_run.py` | Starts your app locally with a sink that records outbound traffic. Shell commands need explicit trust |
-| `qa_console.py` | Browses run results in a local, token-protected page |
-| `qa_check.py` | Health check of the toolkit (`--quick`, `--full`) |
-| `toolkit/engine/invariant_miner.py` | Proposes candidate invariants from observed responses. Information only: a proposal is not a finding |
-| `toolkit/skills/`, `toolkit/agents/`, `toolkit/commands/` | Claude Code skills, agents and commands built on the engines. They run inside Claude Code; see below |
-| `docs/USING.md` | Step-by-step guide: setup, spec, first run, reading results, limits |
+| Four new APIs, 10 planted bugs each, spec written blind, no tuning | 3 of 40 found (95% interval 2.6% to 19.9%) |
+| Same, after tuning the spec on a clean copy | 13 of 40 found (95% interval 20.1% to 48.0%) |
+| Immich photo app v3.0.0, blind spec, known access bugs | 0 of 4 found |
+| Our own demo app (bugs we planted on purpose) | Most planted bugs found. This is not a recall figure |
 
-## Skills and agents
+One run, one seed. Repeat important runs with `--seed`.
 
-The skills, agents and commands are instructions for Claude Code. Install the plugin (`claude --plugin-dir <repo>/toolkit`) and Claude follows them. They add review methods on top of the engines. Some of them call command-line tools that are **not** included here: `semgrep`, `ubs` (ultimate bug scanner), `jq`, and optionally `codeql`. Install a tool only if you want the step that uses it.
+---
 
-Third-party material keeps its own licence. The Trail of Bits skills and agents are CC BY-SA 4.0; each folder has an `ATTRIBUTION.md`. See [`NOTICE.md`](NOTICE.md).
+## Before you start
+
+| You need | Why |
+|---|---|
+| Windows 10 | The only system tested (Windows 11 and other systems are not tested) |
+| Python 3.12 and `uv` | The engines run on Python 3.12 through `uv` |
+| Git | To get this repository |
+| Your API running locally | The toolkit talks only to `127.0.0.1`, `localhost`, or `::1` |
+| Claude Code (optional) | For the `/qa-toolkit:qa-hunt` command |
+
+Other tools are optional and only used by some steps: `semgrep`, `gitleaks`, `osv-scanner`, `trivy`, `ubs`, `schemathesis`, Playwright with Chromium, and the `pg8000` or `pymongo` drivers. Details are in [Dependencies](#dependencies).
+
+---
 
 ## Quick start
 
-1. Install Python and `uv`: `python -m pip install uv`, then `python -m uv python install 3.12`.
-2. Check the toolkit: `python qa_check.py --quick` (about 10 minutes; the last line should say `VERDICT: no FAIL`).
-3. Describe your API in a spec (start from `toolkit/examples/demo-flask-shop/qa-spec.py`), check it with `--preflight`, then run the engines. Full steps are in [`docs/USING.md`](docs/USING.md).
+**1. Check the toolkit is healthy** (about 10 minutes):
 
-**This tool creates and changes records in the API it tests.** Run it only against a local test database, never against production.
+```
+python qa_check.py --quick
+```
 
-## What a finding looks like
+The last lines should say `VERDICT: no FAIL`.
 
-From the demo shop (a planted bug, so the answer is known):
+**2. Describe your API.** Start from the example in `toolkit/examples/demo-flask-shop/qa-spec.py`. Replace the test users, routes and public endpoints with yours.
+
+**3. Check the spec, then run.** Step-by-step commands, with what each file means, are in [`docs/USING.md`](docs/USING.md).
+
+Results appear in a `qa-report/` folder next to your project.
+
+---
+
+## Using it with Claude Code
+
+Install the plugin from the `toolkit` folder:
+
+```
+claude --plugin-dir <repo>/toolkit
+```
+
+Then, inside Claude Code, run the full hunt on a project:
+
+```
+/qa-toolkit:qa-hunt <path-to-your-project>
+```
+
+Claude reads the project, writes the spec, runs the engines, and writes a report. Claude's own reading of the code is a lead, not a proof. Every finding should be reproduced before it is reported.
+
+If you run it headless (`claude -p`), the `Skill` tool must be in the allowed list, otherwise the command is not found. Example and details: [`docs/USING.md`](docs/USING.md).
+
+---
+
+## Reading the results
+
+| Word | Meaning |
+|---|---|
+| **high / medium / low / info** | How serious the finding looks if it is real. Severity is a guess, not a verdict |
+| **RAN_OK** | The check ran completely |
+| **DEGRADED** | The check ran, but part of it was skipped or limited. Weak evidence |
+| **SKIPPED** | The check did not run, usually because the spec has no data for it |
+| **ERRORED** | The check crashed. Treat its silence as unknown |
+| **PARTIAL** (the overall verdict) | Some checks did not run. "No findings" is weak evidence |
+
+An example from the demo shop (a planted bug, so the answer is known):
 
 ```
 ## authz: 4 finding(s) [RAN_OK]
@@ -41,44 +113,66 @@ From the demo shop (a planted bug, so the answer is known):
   resource created by user_a - body identical to the owner's: data exposed
 ```
 
-Each finding names the endpoint, the role that got through, the status it got, and the evidence. Reproduce it before you report it.
+Each finding names the endpoint, the role that got through, the status it got and the evidence.
 
-## How well it works (measured, and deliberately modest)
+---
 
-On four fresh blind APIs with 10 planted bugs each (40 bugs in total, one run, one seed), the engines found:
+## Safety rules
 
-| Setup | Bugs found | 95% interval (Wilson) |
-|---|---|---|
-| Zero-config (the spec as translated, no tuning) | 3 of 40 | 2.6%–19.9% |
-| Tuned (spec written blind from the README and OpenAPI, tuned only on a clean copy) | 13 of 40 | 20.1%–48.0% |
+- **Local only.** The engines refuse non-local addresses. Never point them at production or a shared server.
+- **Test data only.** The runs create users, orders and other records in your test database.
+- **Keys stay out of commands.** Put keys in the gitignored `.env` file (see `.env.example`).
+- **Shell commands need trust.** A command in a profile runs only when the profile says `trusted: true`, which you set after you have reviewed it.
+- **Check run folders before sharing.** They contain request traces and test data.
 
-Each arm also produced 11 findings that also appear on the clean copy (false positives). "Blind" here means the spec was written by a separate agent that did not see the answer key; the result depends heavily on spec quality. Demo and development numbers are not recall, and the four targets are now used up for an unbiased test.
+---
 
-Known limits: counters that drift, error-code mismatches such as 422 versus 413, version rollback, and quota or refund formulas that are stated only in prose are missed. Per-run results vary, so repeat important runs with `--seed`.
+## Limits
 
-## Security notes
+- Tested only on Windows, only with Python 3.12.
+- Counters that drift, error-code mismatches such as 422 versus 413, version rollback, and quota or refund formulas written only in prose are missed.
+- The static checks are heuristics. They can give false alarms, and they can miss common patterns.
+- The LLM spec helper is optional and off by default. Do not point it at a server you do not trust with your code.
 
-- Engines talk only to local apps (`127.0.0.1`, `localhost`, `::1`). Keep it that way: never point a run at production or a shared server.
-- Keys live in a gitignored `.env` file. Never paste a key into a command.
-- A shell command from a profile runs only when the profile says `trusted: true`, which you set yourself for a profile you have reviewed. Prefer argv lists (`run_cmd_argv`, `reset_cmd_argv`).
-- Run folders contain request traces and, for the engines, test data. Check them before you share them.
+---
+
+## What is in the box
+
+| Path | What it is |
+|---|---|
+| `toolkit/engine/` | The engines. Core: `authz`, `negative`, `stateful`, `race`, `scenario`, `static`. Experimental (no measured recall yet): `schema`, `auth`, `exposure`, `differential`, `workflow`, `metamorphic`, `logic` |
+| `toolkit/engine/run.py` | Runs the engines against a spec. `--preflight` checks the spec without sending attack traffic |
+| `toolkit/engine/safe_run.py` | Starts your app locally with a sink that records outbound traffic |
+| `toolkit/engine/invariant_miner.py` | Proposes candidate rules from observed responses. A proposal is not a finding |
+| `qa_console.py` | Browses run results in a local, token-protected page |
+| `qa_check.py` | Health check of the toolkit (`--quick`, `--full`) |
+| `toolkit/skills/`, `toolkit/agents/`, `toolkit/commands/` | Claude Code skills, agents and commands built on the engines |
+| `docs/USING.md` | Step-by-step guide: setup, spec, first run, reading results |
+
+---
 
 ## Dependencies
 
-Nothing here is bundled. What each part needs (checked against the scripts):
-- **Python 3.12** for the engines (`python -m uv run --no-project --python 3.12 --with hypothesis ...`). `qa_console.py` runs with plain `python`.
-- **`scan.ps1`** (Windows PowerShell only; there is no bash version) runs these if they are on PATH and skips them with a message if not: `semgrep` (required for the static step), `gitleaks`, `osv-scanner`, `trivy` (optional), `ubs` (optional, called through bash), `schemathesis` (only with `-ApiUrl`).
-- **`e2e_crawl.py`** needs Playwright and a Chromium it can drive (`python -m uv run --with playwright playwright install chromium`).
-- **`dbcheck.py`** needs `pg8000` (PostgreSQL) or `pymongo` (MongoDB) for the database checks; pass `--with pg8000` or `--with pymongo` on the run.
+Nothing here is bundled. Checked against the scripts.
+
+- **Python 3.12** for the engines: `python -m uv run --no-project --python 3.12 --with hypothesis ...`. `qa_console.py` runs with plain `python`.
+- **`scan.ps1`** (Windows PowerShell only) runs `semgrep` (needed for the static step), `gitleaks`, `osv-scanner`, `trivy`, `ubs` and `schemathesis` if they are on PATH, and skips missing ones with a message.
+- **`e2e_crawl.py`** needs Playwright and Chromium: `python -m uv run --with playwright playwright install chromium`.
+- **`dbcheck.py`** needs `pg8000` (PostgreSQL) or `pymongo` (MongoDB): add `--with pg8000` or `--with pymongo` to the run.
 
 ## LLM helper (optional, off by default)
 
-`toolkit/synthesize.py` and `toolkit/rules_from_llm.py` send content to an LLM provider, and only when you name one (`--provider`, `--key-env`, `--api-url`, `--model`, or the matching `QA_LLM_*` variables in `.env`). What they send: the endpoint list from the OpenAPI document (paths, body field names, examples), and with `--source` short snippets of route-handler code. It goes to the URL you give, with the key read from the environment variable you name; redirects are refused. Do not point it at a server you do not trust with your code. `synthesize.py` screens its generated spec for `os`, `subprocess`, `eval`, `exec` and similar before writing it, and refuses to write on a match. This is a screen, not a sandbox. `rules_from_llm.py` is not covered by that screen.
+`toolkit/synthesize.py` and `toolkit/rules_from_llm.py` can send content to an LLM provider, but only when you name one (`--provider`, `--key-env`, `--api-url`, `--model`, or the `QA_LLM_*` variables in `.env`). They send the endpoint list from your OpenAPI file (paths, field names, examples) and, with `--source`, short code snippets. The key is read from the variable you name, and redirects are refused. `synthesize.py` screens its generated spec for dangerous calls such as `os`, `subprocess` and `eval` before writing it. This is a screen, not a sandbox, and `rules_from_llm.py` is not covered by it.
 
-## Tested on
+---
 
-The author tested it on Windows 10 with Python 3.12. Other systems are not tested.
+## Documentation
+
+- [`docs/USING.md`](docs/USING.md): the step-by-step guide.
+- [`NOTICE.md`](NOTICE.md) and [`SOURCES.md`](SOURCES.md): third-party material and its licences.
 
 ## Licence
 
-MIT for the original code. Third-party material keeps its own licence (CC BY-SA 4.0 for the Trail of Bits material), listed in [`NOTICE.md`](NOTICE.md) and [`SOURCES.md`](SOURCES.md).
+The original code and documentation are under the MIT licence (see [`LICENSE`](LICENSE)). Third-party material keeps its own licence: the Trail of Bits skills and agents are CC BY-SA 4.0, and the Anthropic prompts are MIT. Each folder with third-party material has an `ATTRIBUTION.md`. See [`NOTICE.md`](NOTICE.md).
+
+Whether the combined work can be relicensed under a single licence has not been reviewed by a lawyer. Check this before you redistribute it.
