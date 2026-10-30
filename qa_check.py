@@ -5,7 +5,7 @@
   python qa_check.py --full       # quick + selftest x3 consistency + a seeded benchmark (needs its own data) (~30+ min, needs Mongo running)
 
 Every step prints PASS / FAIL / SKIP / WARN with a reason. Full output of every step goes to
-logs/qa-check-<time>.log. Exit code 0 = no FAIL. Stdlib only, so it runs on the system python.
+~/qa-runs/qa-out/qa-check-logs/qa-check-<time>.log (set QA_CHECK_LOGS to change it). Exit code 0 = no FAIL. Stdlib only, so it runs on the system python.
 """
 import datetime
 import json
@@ -17,7 +17,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-LOGS = ROOT / "logs"
+# Logs go outside the repo (the repo stays free of junk, even ignored files). QA_CHECK_LOGS overrides the folder.
+LOGS = Path(os.environ.get("QA_CHECK_LOGS") or Path.home() / "qa-runs" / "qa-out" / "qa-check-logs")
 # Optional local targets: set these env vars to enable the SKIP-by-default checks; unset = SKIP with reason.
 SEEDED_BENCH = Path(os.environ.get("QA_SEEDED_BENCH", "unset/seeded-benchmark.json"))
 EXTRA_DIR = Path(os.environ.get("QA_EXTRA_TARGET_DIR", "unset/extra-target"))

@@ -9,7 +9,7 @@ qa-spec.py:
   INVARIANTS = [fn(api, log, ctx)]   raise AssertionError with a clear message when broken
   ACTORS = ["user_a", "user_b", "admin"]   roles that act (default: every configured non-anon role)
   ADMIN_ONLY / ADMIN_ROLE ("admin"): those endpoints are mostly called as the admin role so the search reaches deep states.
-  STATEFUL_SKIP = {"POST /auth/login"}   endpoints never used as random actions (SKIP also applies, to every engine)
+  STATEFUL_SKIP = {"POST /auth/login"}   endpoints never used as random actions (only this engine reads it; put routes in SKIP to keep every engine off them)
   Built-in actions: one rule per write endpoint (random role/body/id) plus `repeat` (replay an earlier request).
   STATEFUL_BODIES = {"POST /orders/": {...}}  fixed body instead of generated ones (rarely wanted; BODIES is for authz only) (e.g. real ids from ctx are better set via BODY_HOOKS)
   BODY_HOOKS = {"POST /orders/": fn(body, ctx) -> body}   patch generated body with real ids
