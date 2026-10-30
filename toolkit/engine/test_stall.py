@@ -66,9 +66,8 @@ def test_requests_after_the_stall_are_not_sent():
     api = _client(srv)
     for _ in range(3):
         api.call("anon", "GET", "/slow")
-    started = time.time()
     r = api.call("anon", "GET", "/fast")
-    assert r.transport and time.time() - started < 0.05 and len(api.log) == 4
+    assert r.transport and "not sent" in r.text and len(api.log) == 4
 
 
 def test_a_single_lost_request_is_forgiven():
@@ -76,7 +75,9 @@ def test_a_single_lost_request_is_forgiven():
     api = _client(srv)
     api.call("anon", "GET", "/slow")
     api.call("anon", "GET", "/slow")
+    api.timeout = 30                                # only the slow route may time out: a busy machine must not fail this test
     assert api.call("anon", "GET", "/fast").ok
+    api.timeout = 0.1
     api.call("anon", "GET", "/slow")
     assert api.stalled is None
 
