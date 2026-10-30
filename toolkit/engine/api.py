@@ -139,6 +139,8 @@ class Api:
         if query:
             url += "?" + urllib.parse.urlencode(query, doseq=True)
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        if role not in self.roles and self.roles.keys() - {"anon"}:   # a role map was given but lacks this role: fail, do not go anonymous silently
+            raise KeyError(f"role {role!r} is not defined: setup() did not return it, so the request would have been anonymous")
         headers = {"Content-Type": "application/json", **self.roles.get(role, {}), **(headers or {})}
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         msg = None
