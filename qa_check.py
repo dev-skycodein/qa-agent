@@ -1,7 +1,7 @@
 """One-command health check for the QA toolkit. Run it in a normal terminal (outside Claude):
 
   python qa_check.py              # interactive menu
-  python qa_check.py --quick      # preflight + safety + trust tests + selftest (~2-3 min)
+  python qa_check.py --quick      # preflight + safety + trust tests + the whole test suite + selftest (~15 min, first run longer)
   python qa_check.py --full       # quick + selftest x3 consistency + a seeded benchmark (needs its own data) (~30+ min, needs Mongo running)
 
 Every step prints PASS / FAIL / SKIP / WARN with a reason. Full output of every step goes to
@@ -139,17 +139,14 @@ def step_console(log_fh):
 
 
 def step_unit_tests(log_fh):
-    files = ["test_stats.py", "test_invariant_miner.py", "test_authz.py", "test_detect.py", "test_gate.py", "test_preflight.py", "test_security_fixes.py",
-             "test_safe_run.py", "test_api_schema.py",
-             "test_schema_fuzz.py", "test_metamorphic.py", "test_logic_engine.py", "test_auth_attacks.py",
-             "test_differential.py", "test_shrink.py", "test_exposure.py", "test_metamorphic_extra.py", "test_workflow_chains.py",
-             "toolkit/test_rules_from_llm.py", "toolkit/test_synthesize_provider.py"]
-    for name in files:
-        path = ROOT / name if name.startswith("toolkit/") else ROOT / "toolkit" / "engine" / name
-        code, out = run_cmd([sys.executable, str(path)], ROOT, 300, log_fh)
-        if code != 0:
-            return Result("stats + miner + authz tests", FAIL, f"{name}: " + ("timed out" if code is None else tail(out, 2).replace("\n", " | ")), out)
-    return Result("stats + miner + authz tests", PASS, "Wilson/bounds, mined-invariant and authz-oracle tests green")
+    """The whole suite through pytest: folders, not a hand-kept list, so a new test file cannot be left out."""
+    cmd = [sys.executable, "-m", "uv", "run", "--no-project", "--python", "3.12", "--with", "pytest", "--with", "hypothesis", "--with", "pyjwt",
+           "--with", "requests", "python", "-m", "pytest", "-p", "no:cacheprovider", "-q", "--tb=short", "-m", "not slow", "tests", "toolkit/engine",
+           "toolkit/test_llm_optional.py", "toolkit/test_rules_from_llm.py", "toolkit/test_synthesize_provider.py"]
+    code, out = run_cmd(cmd, ROOT, 1500, log_fh)
+    if code != 0:
+        return Result("full test suite", FAIL, "timed out" if code is None else tail(out, 3).replace("\n", " | "), out)
+    return Result("full test suite", PASS, tail(out, 1), out)
 
 
 def step_clean_control(log_fh):
@@ -181,6 +178,8 @@ def step_selftest_repeat(k):
 def step_bench(log_fh):
     if not SEEDED_BENCH.exists():
         return Result("seeded benchmark", SKIP, "seeds.json not found")
+    if not (ROOT / "benchmarks" / "bench.py").exists():
+        return Result("seeded benchmark", SKIP, "benchmarks/bench.py is not part of this release")
     code, out = run_cmd([sys.executable, str(ROOT / "benchmarks" / "bench.py"), str(SEEDED_BENCH), "--checks", "engines"],
                         ROOT, 4 * 3600, log_fh)
     if code is None:

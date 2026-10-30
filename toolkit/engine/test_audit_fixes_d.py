@@ -85,6 +85,7 @@ def _stub_subprocess(monkeypatch, tmp_path, safe_rc, write_engines):
 def _full_engine_output(out_dir: Path):
     findings = [{"kind": k, "severity": "high", "endpoint": "GET /x", "detail": "d"} for k in sorted(selftest.WANT)]
     findings.append({"kind": "NEG-INJECTION", "severity": "high", "endpoint": "POST /auth/login", "detail": "d"})
+    findings.append({"kind": "RACE-INVARIANT", "severity": "high", "endpoint": "PATCH /x", "detail": "double cancel: d"})
     results = [{"engine": "all", "status": "ran_ok", "findings": findings}]
     (out_dir / "engines.json").write_text(json.dumps(results), encoding="utf-8")
 

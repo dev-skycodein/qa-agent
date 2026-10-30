@@ -604,3 +604,11 @@ if __name__ == "__main__":
         fn()
         print("ok  ", name)
     print(f"SCHEMA FUZZ OK: {len(tests)} tests")
+
+
+def test_role_for_a_route_does_not_need_user_a():
+    import types
+    st = types.SimpleNamespace(role_cache={}, public=set(), owner={}, client=types.SimpleNamespace(roles={"anon": {}, "buyer": {"t": "b"}, "admin": {"t": "x"}}),
+                               note=lambda text: notes.append(text))
+    notes = []
+    assert sf._role(st, "POST /x") == "buyer" and notes == []

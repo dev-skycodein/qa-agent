@@ -49,7 +49,7 @@ Other tools are optional and only used by some steps: `semgrep`, `gitleaks`, `os
 
 ## Quick start
 
-**1. Check the toolkit is healthy** (about 10 minutes):
+**1. Check the toolkit is healthy** (about 15 minutes):
 
 ```
 python qa_check.py --quick
@@ -107,7 +107,7 @@ If you run it headless (`claude -p`), the `Skill` tool must be in the allowed li
 | `supply-chain-risk-auditor` | Checks dependencies for known advisories, abandoned packages and install scripts | Your lockfile |
 | `variant-analysis` | After a bug is found, looks for other places with the same root cause | Its queries run with Semgrep or CodeQL, if you use them; the search steps need nothing extra |
 
-**Agents** (started by the skills above; you do not call them directly):
+**Agents** (started by the skills above only for hard cases, such as a bug that standard checking cannot settle, so a simple run may use none; you do not call them directly):
 
 | Agent | Started by | What it does |
 |---|---|---|
@@ -158,6 +158,8 @@ Each finding names the endpoint, the role that got through, the status it got an
 
 ## Limits
 
+- Measured once on VAmPI, a deliberately vulnerable Flask API that was not written for this tool: of its 9 listed weaknesses, 6 were found, SQL injection only as a 500 error, and 2 were missed (a weak JWT key not in the built-in wordlist, and rate limiting, which no engine checks). One of the 6 (mass assignment) was caught only by an invariant in the spec. One app and one spec is a small sample, not a recall figure.
+- An app that freezes ends the run early: `APP-UNRESPONSIVE` names the request, and the engines after it do not run until you skip that route and run again.
 - Tested only on Windows, only with Python 3.12.
 - Counters that drift, error-code mismatches such as 422 versus 413, version rollback, and quota or refund formulas written only in prose are missed.
 - The static checks are heuristics. They can give false alarms, and they can miss common patterns.
@@ -169,7 +171,7 @@ Each finding names the endpoint, the role that got through, the status it got an
 
 | Path | What it is |
 |---|---|
-| `toolkit/engine/` | The engines. Core: `authz`, `negative`, `stateful`, `race`, `scenario`, `static`. Also run by `/qa-hunt`, no measured recall yet: `auth`, `exposure`. Experimental (not run by `/qa-hunt`, no measured recall yet): `schema`, `differential`, `workflow`, `metamorphic`, `logic` |
+| `toolkit/engine/` | The engines. Core: `authz`, `negative`, `stateful`, `race`, `scenario`, `static`. Also run by `/qa-hunt`: `auth`, `exposure`, `logic` (each finds its planted demo bugs; no measured recall on real apps yet). Experimental (not run by `/qa-hunt`, no measured recall yet): `schema`, `differential`, `workflow`, `metamorphic` |
 | `toolkit/engine/run.py` | Runs the engines against a spec. `--preflight` checks the spec without sending attack traffic |
 | `toolkit/engine/safe_run.py` | Starts your app locally with a sink that records outbound traffic |
 | `toolkit/engine/invariant_miner.py` | Proposes candidate rules from observed responses. A proposal is not a finding |

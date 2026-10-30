@@ -4,6 +4,8 @@ import json
 PUBLIC = {"GET /items", "GET /items/{item_id}", "POST /auth/register", "POST /auth/login"}
 ADMIN_ONLY = {"POST /items"}            # "/admin/..." paths are added automatically
 OWNER = {"POST /items": "admin"}
+SKIP = {"POST /auth/logout"}            # would end the roles' own sessions; the auth engine still attacks it through LOGOUT
+LOGOUT = {"path": "/auth/logout", "method": "POST"}
 STATEFUL_SKIP = {"POST /auth/register", "POST /auth/login", "POST /admin/reset-prices", "POST /items"}   # no effect on the stock rules
 BODIES = {}                             # filled by setup() once a real item exists
 USERS = {"user_a": "a@demo.test", "user_b": "b@demo.test", "admin": "admin@demo.test"}
@@ -68,7 +70,21 @@ def _oversell_check(api, results, ctx):
         return f"{created} orders created for 1 unit in stock (stock now {stock})"
 
 
-RACES = [{"name": "oversell last unit", "setup": _oversell_setup, "n": 10, "check": _oversell_check}]
+def _double_cancel_setup(api, ctx):
+    item = api.call("admin", "POST", "/items", {"name": "cancel-me", "price": 10, "stock": 5}).json
+    ctx["cancelled_item"] = item["id"]
+    order = api.call("user_a", "POST", "/orders", {"item_id": item["id"], "quantity": 1}).json
+    return {"method": "PATCH", "path": f"/orders/{order['id']}/status", "role": "user_a", "body": {"status": "cancelled"}}
+
+
+def _double_cancel_check(api, results, ctx):
+    stock = api.call("anon", "GET", f"/items/{ctx['cancelled_item']}").json["stock"]
+    if stock != 5:
+        return f"double cancel: stock is {stock} after concurrent cancels of one order, expected 5"
+
+
+RACES = [{"name": "oversell last unit", "setup": _oversell_setup, "n": 10, "check": _oversell_check},
+         {"name": "double cancel", "setup": _double_cancel_setup, "n": 8, "check": _double_cancel_check}]
 
 
 # ---- scenario: legal order status transitions (product rule: placed -> cancelled only; nothing leaves "cancelled")

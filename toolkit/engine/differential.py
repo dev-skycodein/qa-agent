@@ -65,7 +65,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trust  # noqa: E402
-from api import (Api, WRITE_METHODS, endpoints, example, extract_id, key, load_openapi, prefix_of, resolve,  # noqa: E402
+from api import (Api, WRITE_METHODS, default_owner, endpoints, example, extract_id, key, load_openapi, prefix_of, resolve,  # noqa: E402
                  TRANSPORT_ERROR)
 
 ENGINE = "differential"
@@ -437,7 +437,7 @@ class ReplayRunner:
 def _pick_role(api, qa, step) -> str:
     if step["role"] and step["role"] in api.roles:
         return step["role"]
-    owner = getattr(qa, "OWNER", {}).get(step["key"], "user_a")
+    owner = getattr(qa, "OWNER", {}).get(step["key"], default_owner(api.roles, getattr(qa, "ADMIN_ROLE", "admin")))
     if owner in api.roles:
         return owner
     return next((r for r in api.roles if r != "anon"), "anon")

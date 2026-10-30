@@ -1,294 +1,314 @@
 {
- "openapi": "3.0.3",
- "info": {
-  "title": "demo shop",
-  "version": "1"
- },
- "paths": {
-  "/auth/register": {
-   "post": {
-    "summary": "register",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "type": "object",
-        "properties": {
-         "email": {
-          "type": "string",
-          "format": "email"
-         },
-         "password": {
-          "type": "string",
-          "minLength": 4
-         }
+  "openapi": "3.0.3",
+  "info": {
+    "title": "demo shop",
+    "version": "1"
+  },
+  "paths": {
+    "/auth/register": {
+      "post": {
+        "summary": "register",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
         },
-        "required": [
-         "email",
-         "password"
-        ]
-       }
-      }
-     }
-    }
-   }
-  },
-  "/auth/login": {
-   "post": {
-    "summary": "login",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "type": "object",
-        "properties": {
-         "email": {
-          "type": "string"
-         },
-         "password": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "email",
-         "password"
-        ]
-       }
-      }
-     }
-    }
-   }
-  },
-  "/items": {
-   "get": {
-    "summary": "list items",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    }
-   },
-   "post": {
-    "summary": "create item (admin)",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "type": "object",
-        "properties": {
-         "name": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 20
-         },
-         "price": {
-          "type": "number",
-          "exclusiveMinimum": 0
-         },
-         "stock": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 1000
-         }
-        },
-        "required": [
-         "name",
-         "price",
-         "stock"
-        ]
-       }
-      }
-     }
-    }
-   }
-  },
-  "/items/{item_id}": {
-   "get": {
-    "summary": "get item",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "parameters": [
-     {
-      "name": "item_id",
-      "in": "path",
-      "required": true,
-      "schema": {
-       "type": "integer"
-      }
-     }
-    ]
-   }
-  },
-  "/orders": {
-   "post": {
-    "summary": "create order",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "type": "object",
-        "properties": {
-         "item_id": {
-          "type": "integer",
-          "minimum": 1
-         },
-         "quantity": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 20
-         },
-         "note": {
-          "type": "string",
-          "maxLength": 200
-         }
-        },
-        "required": [
-         "item_id",
-         "quantity"
-        ]
-       }
-      }
-     }
-    }
-   }
-  },
-  "/orders/{order_id}": {
-   "get": {
-    "summary": "get order",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "parameters": [
-     {
-      "name": "order_id",
-      "in": "path",
-      "required": true,
-      "schema": {
-       "type": "integer"
-      }
-     }
-    ]
-   }
-  },
-  "/orders/{order_id}/status": {
-   "patch": {
-    "summary": "set status",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "type": "object",
-        "properties": {
-         "status": {
-          "type": "string",
-          "enum": [
-           "placed",
-           "shipped",
-           "cancelled"
-          ]
-         }
-        },
-        "required": [
-         "status"
-        ]
-       }
-      }
-     }
-    },
-    "parameters": [
-     {
-      "name": "order_id",
-      "in": "path",
-      "required": true,
-      "schema": {
-       "type": "integer"
-      }
-     }
-    ]
-   }
-  },
-  "/admin/reset-prices": {
-   "post": {
-    "summary": "reset prices (admin)",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "tags": [
-     "admin"
-    ]
-   }
-  },
-  "/reviews": {
-   "post": {
-    "summary": "create review",
-    "responses": {
-     "200": {
-      "description": "ok"
-     }
-    },
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "type": "object",
-        "required": [
-         "order_id",
-         "text"
-        ],
-        "properties": {
-         "order_id": {
-          "type": "integer",
-          "minimum": 1
-         },
-         "text": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 200
-         }
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  },
+                  "password": {
+                    "type": "string",
+                    "minLength": 4
+                  }
+                },
+                "required": [
+                  "email",
+                  "password"
+                ]
+              }
+            }
+          }
         }
-       }
       }
-     }
+    },
+    "/auth/login": {
+      "post": {
+        "summary": "login",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email",
+                  "password"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/items": {
+      "get": {
+        "summary": "list items",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "post": {
+        "summary": "create item (admin)",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 20
+                  },
+                  "price": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "stock": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000
+                  }
+                },
+                "required": [
+                  "name",
+                  "price",
+                  "stock"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/items/{item_id}": {
+      "get": {
+        "summary": "get item",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
+    "/orders": {
+      "post": {
+        "summary": "create order",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "item_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "quantity": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                  },
+                  "note": {
+                    "type": "string",
+                    "maxLength": 200
+                  }
+                },
+                "required": [
+                  "item_id",
+                  "quantity"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/orders/{order_id}": {
+      "get": {
+        "summary": "get order",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
+    "/orders/{order_id}/status": {
+      "patch": {
+        "summary": "set status",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "placed",
+                      "shipped",
+                      "cancelled"
+                    ]
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/reset-prices": {
+      "post": {
+        "summary": "reset prices (admin)",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/reviews": {
+      "post": {
+        "summary": "create review",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "order_id",
+                  "text"
+                ],
+                "properties": {
+                  "order_id": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/me": {
+      "get": {
+        "summary": "my profile",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "summary": "end this session",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     }
-   }
   }
- }
 }

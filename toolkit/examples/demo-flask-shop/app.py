@@ -4,6 +4,8 @@ logged-in user  (4) cancelling twice restocks twice  (5) check-then-act stock ra
 Round 2 (negative / outbound engines): (6) non-integer quantity -> unhandled 500  (7) /auth/register mass assignment: body "role"
 is stored  (8) error handler returns the Python traceback  (9) POST /reviews accepts ANY order_id (cross-user reference)
 (10) order confirmation email embeds the unescaped "note" as HTML  (11) /auth/login posts the plaintext password to an analytics URL  (12) /auth/login builds its SQL by string formatting (injection).
+Round 3 (exposure / auth / race / logic engines): (13) GET /me returns the password  (14) /auth/logout leaves the token valid
+(15) check-then-act status change: concurrent cancels restock several times  (16) POST /items and POST /orders ignore the schema's bounds.
 Environment: DEMO_FIXED=1 fixes all of them (clean control), DEMO_BUGS=3,5 activates only those (mutation sweep)."""
 import html
 import json
@@ -23,7 +25,7 @@ from werkzeug.exceptions import HTTPException
 app = Flask(__name__)
 # Which planted bugs are active: default all; DEMO_FIXED=1 none (clean control for false-positive measurement); DEMO_BUGS=3,5 only those.
 BUGS = frozenset() if os.environ.get("DEMO_FIXED") == "1" else (
-    frozenset(int(x) for x in os.environ["DEMO_BUGS"].split(",") if x.strip()) if os.environ.get("DEMO_BUGS") else frozenset(range(1, 13)))
+    frozenset(int(x) for x in os.environ["DEMO_BUGS"].split(",") if x.strip()) if os.environ.get("DEMO_BUGS") else frozenset(range(1, 17)))
 
 
 def bug(n: int) -> bool:
@@ -117,6 +119,31 @@ def login():
     return jsonify(token=token)
 
 
+@app.post("/auth/logout")
+def logout():
+    u, err = need_user()
+    if err:
+        return err
+    if not bug(14):                                          # BUG 14: the token stays valid after logout
+        TOKENS.pop(request.headers.get("Authorization", "").removeprefix("Bearer "), None)
+    return jsonify(ok=True)
+
+
+@app.get("/me")
+def me():
+    u, err = need_user()
+    if err:
+        return err
+    r = db().execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    if bug(13):                                              # BUG 13: the password column goes out with the profile
+        return jsonify(row(r))
+    return jsonify(id=r["id"], email=r["email"], role=r["role"])
+
+
+def number_in(value, low, high):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and low <= value <= high
+
+
 @app.post("/items")
 def create_item():
     u, err = need_user()
@@ -125,6 +152,8 @@ def create_item():
     if u["role"] != "admin":
         return jsonify(detail="admin only"), 403
     b = request.get_json()
+    if not bug(16) and not (number_in(b["price"], 0.01, 1_000_000) and isinstance(b["stock"], int) and number_in(b["stock"], 0, 1000)):
+        return jsonify(detail="price or stock out of range"), 400      # BUG 16: negative, fractional or huge values are stored
     cur = db().execute("INSERT INTO items(name,price,stock) VALUES(?,?,?)", (b["name"], b["price"], b["stock"]))
     db().commit()
     return jsonify(id=cur.lastrowid, **b), 201
@@ -149,6 +178,8 @@ def create_order():
     b = request.get_json()
     if not bug(6) and not (isinstance(b.get("quantity"), int) and not isinstance(b.get("quantity"), bool) and b["quantity"] > 0):
         return jsonify(detail="quantity must be a positive integer"), 400      # BUG 6: non-integer quantity -> unhandled 500
+    if not bug(16) and isinstance(b.get("quantity"), int) and b["quantity"] > 20:
+        return jsonify(detail="quantity above the limit of 20"), 400           # BUG 16: the schema's maximum is not enforced
     item = db().execute("SELECT * FROM items WHERE id=?", (b["item_id"],)).fetchone()
     if not item:
         return jsonify(detail="no such item"), 404
@@ -213,9 +244,15 @@ def set_status(order_id):                                  # BUG 2: no auth at a
         return jsonify(detail="not found"), 404
     if not bug(4) and (r["status"] != "placed" or status not in ("cancelled", "shipped")):      # state machine: only placed -> cancelled | shipped
         return jsonify(detail=f"illegal transition {r['status']} -> {status}"), 409
+    if not bug(4) and not bug(15):                         # atomic: only one concurrent request can leave "placed"
+        if db().execute("UPDATE orders SET status=? WHERE id=? AND status='placed'", (status, order_id)).rowcount != 1:
+            db().rollback()
+            return jsonify(detail=f"illegal transition -> {status}"), 409
+    else:
+        time.sleep(0.02)                                   # BUG 15: check above, act here, not atomic
+        db().execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
     if status == "cancelled":                              # BUG 4: no 'already cancelled' guard -> restock every time
         db().execute("UPDATE items SET stock = stock + ? WHERE id=?", (r["quantity"], r["item_id"]))
-    db().execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
     db().commit()
     return jsonify(id=order_id, status=status)
 

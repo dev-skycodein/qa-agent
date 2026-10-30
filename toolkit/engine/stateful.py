@@ -32,6 +32,11 @@ def _is_engine_error(exc, first) -> bool:
     return type(exc).__module__.split(".")[0] == "hypothesis"     # by module name: no import needed to decide
 
 
+def empty_invariants(qa) -> list:
+    """Names of the INVARIANTS that can never fail (see trust.checks_nothing): a run on them proves nothing."""
+    return [fn.__name__ for fn in getattr(qa, "INVARIANTS", None) or [] if trust.checks_nothing(fn)]
+
+
 SEQUENCE_CAP = 6000     # chars of a finding's 'sequence' text (the step lines are what shrink.py replays)
 _SEQ_HEADER = "last steps before failure:"
 
@@ -233,6 +238,13 @@ def run(api, spec_doc, qa, max_examples=25, steps=12, time_budget=240, rounds=4,
     if engine_error:
         res["notes"] = res["notes"] + [f"search stopped by an error of Hypothesis itself (not an app finding): {engine_error}"]
         return trust.mark(res, trust.DEGRADED if findings else trust.ERRORED, f"Hypothesis error: {engine_error}"[:400])
+    if stats["steps"] == 0:
+        res["notes"] = ["the search sent no request: every write route needs an id nobody provided (fill ctx['ids'] in fresh_state)"]
+        return trust.mark(res, trust.DEGRADED, "the search sent no request: no invariant was exercised")
     if not getattr(qa, "INVARIANTS", []):
         return trust.mark(res, trust.DEGRADED, "no INVARIANTS in qa-spec.py: only the built-in no-5xx oracle ran")
+    empty = empty_invariants(qa)
+    if empty:
+        res["notes"] = res["notes"] + [f"invariant(s) with an empty body, they can never fail: {', '.join(empty)}"]
+        return trust.mark(res, trust.DEGRADED, f"empty invariant(s) checked nothing: {', '.join(empty)}")
     return trust.mark(res, trust.RAN_OK)

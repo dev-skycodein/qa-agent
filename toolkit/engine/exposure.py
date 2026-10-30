@@ -14,7 +14,10 @@ a plain-text secret; (C) name AND issuance-context filter, plus value shapes as 
 risks: a documented field such as `has_password: true` (boolean values are ignored), a public invite code meant to be shared (severity
 low and 'verify'), a hash that is a content id (only 64-hex under a secret-looking name is reported).
 Names are matched on whole words after camelCase/hyphen normalisation (`accessToken` -> `access_token`, `passenger` is not `pass`).
-Status: ran_ok only when at least one JSON response body was inspected; otherwise skipped_no_spec with the reason.
+Bodies longer than the log cap are read from `full_body`. A 2xx body that was cut and has no `full_body` (the run's memory budget is used
+up, or the app sent more than api.MAX_READ) cannot be parsed: it is counted, and the run is degraded rather than clean.
+Status: ran_ok only when at least one JSON response body was inspected and no cut body was left unread; degraded when one was;
+otherwise skipped_no_spec with the reason.
 """
 import json
 import re
@@ -44,7 +47,7 @@ def _walk(node, path=""):
         for k, v in node.items():
             yield from _walk(v, f"{path}.{k}" if path else k)
     elif isinstance(node, list):
-        for v in node[:20]:
+        for v in node:
             yield from _walk(v, f"{path}[*]")
     else:
         yield path, node
@@ -77,13 +80,14 @@ def _sweep(api, doc, qa, cap=40):
 def run(api, doc, qa=None) -> dict:
     allow = set(getattr(qa, "EXPOSURE_ALLOW", ()) or ())            # "METHOD path.field" the author says is fine
     swept = _sweep(api, doc, qa)
-    seen, findings, inspected = set(), [], 0
+    seen, findings, inspected, unread = set(), [], 0, 0
     for e in api.log:
         if not (200 <= e["status"] < 300):
             continue
         try:
-            body = json.loads(e.get("body") or "")
+            body = json.loads(e.get("full_body") or e.get("body") or "")
         except ValueError:
+            unread += 1 if e.get("truncated") else 0
             continue
         inspected += 1
         issuing = bool(ISSUE_PATH.search(e["path"])) and e["method"] in ("POST", "PUT")
@@ -117,6 +121,9 @@ def run(api, doc, qa=None) -> dict:
     if swept:
         notes.append("the sweep GETs are not verified read-only: a GET may have changed state on the target; exclude with qa.SKIP")
     res = {"engine": "exposure", "findings": findings, "notes": notes, "probes": inspected}
+    if unread:
+        notes.append(f"{unread} long response(s) were cut before this engine saw them: secrets in them were not checked")
+        return trust.mark(res, trust.DEGRADED, f"{unread} long response(s) could not be read")
     if inspected == 0:
         return trust.mark(res, trust.SKIPPED, "no successful JSON response was logged: nothing to inspect")
     return trust.mark(res, trust.RAN_OK)

@@ -14,6 +14,8 @@ Every engine result carries a terminal status, so a failed or skipped engine can
 Results from engines that do not declare a status are treated as `degraded`, never as `ran_ok`.
 `exit_code` keeps "engine broke" (2) apart from "findings present" (1, opt-in) and "all good" (0).
 """
+import dis
+
 RAN_OK, SKIPPED, DEGRADED, SETUP_FAILED, ERRORED = "ran_ok", "skipped_no_spec", "degraded", "setup_failed", "errored"
 STATUSES = (RAN_OK, SKIPPED, DEGRADED, SETUP_FAILED, ERRORED)
 
@@ -84,6 +86,22 @@ def exit_code(results: list, fail_on_findings: bool = False, strict: bool = Fals
     if fail_on_findings and any(f.get("severity") != "info" for r in results for f in r.get("findings", [])):
         return EXIT_FINDINGS
     return EXIT_OK
+
+
+def checks_nothing(fn) -> bool:
+    """True when a spec check (an invariant, a race `check`) can never report a problem: it raises nothing (an assert compiles to a
+    raise), reads none of its arguments, and uses no outside name except print. A body of `pass`, a docstring or a comment is the usual
+    case, because the template ships that way. Judged from the bytecode. Anything that is not a plain function counts as a real check."""
+    code = getattr(fn, "__code__", None)
+    if code is None or code.co_freevars or set(code.co_names) - {"print"}:
+        return False
+    args = set(code.co_varnames[:code.co_argcount + code.co_kwonlyargcount + bool(code.co_flags & 4) + bool(code.co_flags & 8)])
+    for i in dis.get_instructions(code):
+        if i.opname == "RAISE_VARARGS":
+            return False
+        if i.opname.startswith("LOAD_FAST") and args & set(i.argval if isinstance(i.argval, tuple) else (i.argval,)):
+            return False
+    return True
 
 
 def cross_check(results: list, request_count: int = 0) -> list:

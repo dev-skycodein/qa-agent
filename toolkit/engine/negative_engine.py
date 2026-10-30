@@ -38,7 +38,7 @@ import json
 import re
 from urllib.parse import quote
 
-from api import WRITE_METHODS, endpoints, example, extract_id, fill, key, prefix_of, resolve
+from api import WRITE_METHODS, attacker_for, default_owner, endpoints, example, extract_id, fill, key, prefix_of, resolve
 import trust
 
 LEAK_PATTERNS = [
@@ -264,7 +264,8 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
             return roles_override[k]
         if k in admin_only and admin_role in api.roles:
             return admin_role
-        return owner_map.get(k, "user_a") if owner_map.get(k, "user_a") in api.roles else next((r for r in api.roles if r != "anon"), "anon")
+        owner = owner_map.get(k, default_owner(api.roles, admin_role))
+        return owner if owner in api.roles else next((r for r in api.roles if r != "anon"), "anon")
 
     hooks = getattr(qa, "BODY_HOOKS", {})
     try:
@@ -313,7 +314,7 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
         # a baseline that already answers 5xx is one finding; its mutations' 5xx answers would only repeat it (30 copies measured)
         if resp.server_error and not (base5[0] and desc != "baseline"):
             add("NEG-5XX", "medium", ep, f"{desc} -> {resp.status} (expected 4xx)", resp, request, dedupe=desc)
-        elif resp.transport:       # no HTTP answer at all: the app dropped the connection, hung or crashed (or the client hit a socket limit)
+        elif resp.transport and not getattr(api, "stalled", None):  # no HTTP answer: dropped, hung, crashed or a socket limit. After a stall the request was never sent
             add("NEG-NO-RESPONSE", "medium", ep, f"{desc} -> no HTTP response ({resp.text[:80]}): app crashed, hung or dropped the connection",
                 resp, request, dedupe=desc)
         for label in _leaks(resp.text, ok=resp.ok):
@@ -468,7 +469,8 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                                 "to prove it is stored; verify manually)", resp, {name: value}, dedupe=name)
 
         # --- cross-reference IDOR: body field pointing at another user's resource
-        if ep["method"] in ("POST", "PUT", "PATCH") and isinstance(base_body, dict) and "user_b" in api.roles and role != "user_b":
+        attacker = attacker_for(api.roles, role, admin_role)
+        if ep["method"] in ("POST", "PUT", "PATCH") and isinstance(base_body, dict) and attacker:
             for name in list(base_body):
                 m = re.fullmatch(r"(.+?)(?:_id|Id|ID)", name)
                 if not m:
@@ -480,20 +482,20 @@ def run(api, spec_doc, qa, max_per_endpoint=None) -> dict:
                 if budget[0] <= 0:
                     skipped[0] += 2                    # the control and the attack request this check would send
                     continue
-                owner = owner_map.get(f"POST {coll}", "user_a")
-                if owner == "user_b" or owner not in api.roles:
+                owner = owner_map.get(f"POST {coll}", default_owner(api.roles, admin_role))
+                if owner == attacker or owner not in api.roles:
                     continue
                 victim_id = make_resource(coll, owner)
-                own_id = make_resource(coll, "user_b")
+                own_id = make_resource(coll, attacker)
                 if victim_id is None or own_id is None:
                     continue
-                ctrl = api.call("user_b", ep["method"], path, {**base_body, name: own_id})
-                att = api.call("user_b", ep["method"], path, {**base_body, name: victim_id})
+                ctrl = api.call(attacker, ep["method"], path, {**base_body, name: own_id})
+                att = api.call(attacker, ep["method"], path, {**base_body, name: victim_id})
                 sent[0] += 2
                 if ctrl.ok and att.ok:
-                    # medium: the server accepted the reference. No effect on user_a's data was read back, so access is not proven
-                    add("XREF-IDOR", "medium", ep, f"user_b's request referencing user_a's {coll} via body field {name} was accepted "
-                        f"({att.status}); no effect on user_a's data was read back (not proven access)", att,
+                    # medium: the server accepted the reference. No effect on the owner's data was read back, so access is not proven
+                    add("XREF-IDOR", "medium", ep, f"{attacker}'s request referencing {owner}'s {coll} via body field {name} was accepted "
+                        f"({att.status}); no effect on {owner}'s data was read back (not proven access)", att,
                         {name: victim_id}, dedupe=name)
 
         if skipped[0] > skipped_at_start:

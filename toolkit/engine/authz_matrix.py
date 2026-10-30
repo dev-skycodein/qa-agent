@@ -4,11 +4,12 @@ Checks (all candidates, to be proven by a PoC):
   BOLA/IDOR      resource created by OWNER role is readable/changeable by another user or anon
   MISSING-AUTH   endpoint (not in PUBLIC) answers 2xx to anon
   PRIV-ESC       admin-only endpoint answers 2xx to a plain user
+  AUTHZ-WRITE-UNVERIFIED  another user's write got 2xx on a field no read-back shows (a password, say): not proven, verify by hand
 
 Spec (qa-spec.py) knobs, all optional:
   PUBLIC      {"GET /products/", ...}   endpoints meant to be open to anon
   ADMIN_ONLY  {"POST /products/", ...}  extra admin-only endpoints (paths containing /admin are auto-added)
-  OWNER       {"POST /orders/": "user_a"}  role that creates the resource (default user_a)
+  OWNER       {"POST /orders/": "user_a"}  role that creates the resource (default user_a, else the first non-admin role)
   BODIES      {"POST /orders/": {...}}  valid bodies where the schema example is not enough
   IDS         {"user_id": "<id of a throwaway user>"}   ids used when probing admin-only endpoints that take a path param
   SKIP        {"POST /auth/logout"}     endpoints never probed
@@ -21,10 +22,9 @@ Spec (qa-spec.py) knobs, all optional:
 """
 import re
 
-from api import WRITE_METHODS, endpoints, example, extract_id, fill, key, prefix_of
+from api import WRITE_METHODS, attacker_for, default_owner, endpoints, example, extract_id, fill, key, plain_roles, prefix_of
 import trust
 
-ATTACKERS = ("user_b", "anon")
 LOGIC_STATUSES = (409, 410)     # business-rule answers (conflict / gone): nobody asks "may you?" with these, so the access check was passed or missing
 
 
@@ -96,6 +96,15 @@ def _write_readback(api, owner, child, path, write_body, write_resp, before=None
     if changed:
         return ("BOLA/IDOR", "high", f" - read-back: owner GET changed to the attacker's write fields {changed}")
     return None
+
+
+def _effect_hidden(api, owner, child, path, write_body) -> bool:
+    """After an unproven 2xx write: True when the owner's read-back cannot show any field the attacker sent. A field that is visible
+    and unchanged is a real no-op; a field nobody can read back (a password) may have changed, so silence would hide the bug."""
+    if not (write_body and isinstance(write_body, dict)) or child["method"] == "DELETE":
+        return False
+    state = _read_state(api, owner, child, path)
+    return not (state.ok and isinstance(state.json, dict) and any(k in state.json for k in write_body))
 
 
 MEMBER_RE = re.compile(r"member|collaborator|participant|share|invite", re.I)
@@ -226,6 +235,15 @@ def run(api, spec_doc, qa) -> dict:
     declared_admin = set(getattr(qa, "ADMIN_ONLY", set()))
     findings, notes, setup_failed, probes = [], [], [], 0
     grants = _grants(qa, notes)
+    admin_role = getattr(qa, "ADMIN_ROLE", "admin")
+    plain = plain_roles(api.roles, admin_role)                 # every non-admin role, whichever role created the resource
+    fallback_owner = default_owner(api.roles, admin_role)
+    if len(plain) < 2:
+        notes.append(f"only {len(plain)} non-admin role(s) in setup(): BOLA/IDOR between users was not tested; add a second ordinary user")
+
+    def attackers(owner):
+        return tuple(a for a in (attacker_for(api.roles, owner, admin_role), "anon") if a)
+
     excused = []                  # READ probes a declared GRANTS entry explains: listed, not findings
     probed: set[str] = set()      # id-endpoints actually attacked (through a creator, OWNED_IDS, or the admin-only probe)
     admin_noted: set[str] = set() # admin-only id-endpoints already noted (IDS missing): not noted a second time as unprobed
@@ -237,7 +255,7 @@ def run(api, spec_doc, qa) -> dict:
 
     creators = [e for e in eps if e["method"] == "POST" and not e["path_params"] and key(e) not in skip]
     for creator in creators:
-        owner = owner_map.get(key(creator), "user_a")
+        owner = owner_map.get(key(creator), fallback_owner)
         if owner not in api.roles:
             notes.append(f"{key(creator)}: owner role '{owner}' not configured, skipped")
             continue
@@ -271,11 +289,11 @@ def run(api, spec_doc, qa) -> dict:
             _member_write(api, eps, spec_doc, qa, owner, extract_id(first.json), collection, skip, add, notes)
         except Exception as exc:          # an odd answer must not kill the matrix: note it (the status degrades)
             notes.append(f"{key(creator)}: member write check crashed: {type(exc).__name__}: {exc}"[:200])
-        for attacker in ATTACKERS:        # each attacker owns a resource too: a membership check that only asks "member of SOME x?" is invisible otherwise
+        for attacker in attackers(owner):  # each attacker owns a resource too: a membership check that only asks "member of SOME x?" is invisible otherwise
             if attacker != "anon" and attacker != owner and attacker in api.roles:
                 api.call(attacker, "POST", creator["path"], body)
         for child in children:
-            for attacker in ATTACKERS:
+            for attacker in attackers(owner):
                 if attacker not in api.roles or attacker == owner or key(child) in public:
                     continue                  # the owner reading its own resource is not an access finding
                 rid = make()
@@ -304,6 +322,10 @@ def run(api, spec_doc, qa) -> dict:
                         else:
                             _note_once(notes, f"{key(child)}: {attacker}'s {child['method']} got {resp.status} but the owner's read-back shows no "
                                               "changed value set by the attacker (no-op, or effect not readable): not reported as an access finding")
+                            if _effect_hidden(api, owner, child, path, wbody):
+                                add("AUTHZ-WRITE-UNVERIFIED", "medium", child, attacker, resp,
+                                    f"{attacker} got {resp.status} on {child['method']} {path}, resource of {owner}; no read-back shows the fields sent, "
+                                    "so the change is not proven: check by hand whether it took effect")
                     else:
                         kind = "BOLA/IDOR" if attacker != "anon" else "MISSING-AUTH"
                         sev = "medium" if attacker != "anon" else "high"
@@ -327,7 +349,7 @@ def run(api, spec_doc, qa) -> dict:
                     own = api.call(owner, "GET", path)
                     if not own.ok:
                         continue                                  # the owner cannot read it either: precondition missing, say nothing
-                for attacker in ATTACKERS:
+                for attacker in attackers(owner):
                     if attacker not in api.roles or attacker == owner or key(child) in public:
                         continue
                     probes += 1
@@ -351,6 +373,10 @@ def run(api, spec_doc, qa) -> dict:
                             else:
                                 _note_once(notes, f"{key(child)}: {attacker}'s {child['method']} got {resp.status} but the owner's read-back shows no "
                                                   "changed value set by the attacker (no-op, or effect not readable): not reported as an access finding")
+                                if _effect_hidden(api, owner, child, path, wbody):
+                                    add("AUTHZ-WRITE-UNVERIFIED", "medium", child, attacker, resp,
+                                        f"{attacker} got {resp.status} on {child['method']} {path}, resource of {owner} (OWNED_IDS); no read-back shows the "
+                                        "fields sent, so the change is not proven: check by hand whether it took effect")
                         else:
                             kind = "BOLA/IDOR" if attacker != "anon" else "MISSING-AUTH"
                             ev_sev, ev_text = _compare_with_owner(api, owner, child, path, resp, own if child["method"] == "GET" else None)
@@ -362,17 +388,15 @@ def run(api, spec_doc, qa) -> dict:
 
     # admin-only endpoints that take an id (e.g. PATCH /users/{user_id}/role): need IDS = {"user_id": <a harmless id>}
     ids = getattr(qa, "IDS", {})
-    admin_role = getattr(qa, "ADMIN_ROLE", "admin")
-    plain_roles = [r for r in api.roles if r not in ("anon", admin_role)]     # every non-admin role, whichever role created the resource
     for ep in eps:
         k = key(ep)
-        if k in skip or not ep["path_params"] or k not in admin_only or not plain_roles:
+        if k in skip or not ep["path_params"] or k not in admin_only or not plain:
             continue
         if not all(p in ids for p in ep["path_params"]):
             _note_once(notes, f"{k}: admin-only but IDS lacks {ep['path_params']} in qa-spec.py, not probed")
             admin_noted.add(k)
             continue
-        for role in plain_roles:
+        for role in plain:
             probes += 1
             probed.add(k)
             resp = api.call(role, ep["method"], fill(ep["path"], ids), _body(ep, qa, spec_doc))
@@ -394,11 +418,11 @@ def run(api, spec_doc, qa) -> dict:
             elif resp.status in LOGIC_STATUSES:
                 add("AUTHZ-REACHED-LOGIC", "medium", ep, "anon", resp,
                     f"anon got {resp.status}: not 401/403, so the request got past authentication and was stopped by a business rule")
-        if k in admin_only and "user_a" in api.roles:
+        if k in admin_only and fallback_owner in plain:
             probes += 1
-            resp = api.call("user_a", ep["method"], fill(ep["path"], {}), body)
+            resp = api.call(fallback_owner, ep["method"], fill(ep["path"], {}), body)
             if resp.ok:
-                add("PRIV-ESC", "high", ep, "user_a", resp, f"plain user got {resp.status} on admin-only endpoint" + _priv_detail(k, declared_admin))
+                add("PRIV-ESC", "high", ep, fallback_owner, resp, f"plain user got {resp.status} on admin-only endpoint" + _priv_detail(k, declared_admin))
 
     # id-routes the run could not attack at all (no POST creator for their collection, no OWNED_IDS entry, or several path params):
     # MISSING-AUTH and PRIV-ESC were never tested for them. Say so: a note, which makes the run DEGRADED, never a silent ran_ok

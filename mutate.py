@@ -11,7 +11,7 @@ engines run, and the sweep records
   errored     engines whose trust status was `errored` (a pass with an errored engine is not evidence either way)
 Output: runs/mutation-<time>/sweep.json and sweep.md (gitignored). Recall is printed as k/n with a Wilson interval (stats.py).
 
-Honest limits: the 12 bugs are the same author's as the engines (selftest classes), so this measures isolation, repeatability and
+Honest limits: the 16 bugs are the same author's as the engines (selftest classes), so this measures isolation, repeatability and
 crosstalk, not generalisation to bugs nobody thought of. A hit rate of 1/1 per bug is one sample: use --repeat. Bug 8 (traceback in
 an error body) needs an error to exist, so it is run together with bug 6 (its trigger).
 """
@@ -32,7 +32,7 @@ import trust  # noqa: E402
 # bug id -> (name, [(finding kind, endpoint/detail fragment)] of which at least ONE must be present, extra kinds it may also cause)
 BUGS = {
     1: ("IDOR on GET /orders/<id>", [("BOLA/IDOR", "GET /orders/")], set()),
-    2: ("PATCH status without auth", [("MISSING-AUTH", "PATCH /orders/"), ("AUTHZ-REACHED-LOGIC", "PATCH /orders/")], {"BOLA/IDOR"}),
+    2: ("PATCH status without auth", [("MISSING-AUTH", "PATCH /orders/"), ("AUTHZ-REACHED-LOGIC", "PATCH /orders/")], {"BOLA/IDOR", "AUTHZ-WRITE-UNVERIFIED"}),
     3: ("/admin/reset-prices open to any user", [("PRIV-ESC", "/admin/reset-prices")], set()),
     4: ("no state-machine / double-cancel guard", [("SCENARIO", "order status machine")], {"STATEFUL-INVARIANT"}),
     5: ("check-then-act stock race", [("RACE-INVARIANT", "")], {"STATEFUL-INVARIANT"}),
@@ -42,6 +42,10 @@ BUGS = {
     9: ("review of someone else's order", [("XREF-IDOR", "/reviews")], set()),
     10: ("unescaped note in HTML mail", [("CANARY-IN-EMAIL", "")], set()),
     11: ("password sent to analytics", [("OUTBOUND-LEAK", "")], set()),
+    13: ("password in GET /me", [("EXPOSURE-SECRET-FIELD", "/me")], set()),
+    14: ("token valid after logout", [("AUTH-TOKEN-AFTER-LOGOUT", "")], set()),
+    15: ("concurrent cancels restock several times", [("RACE-INVARIANT", "double cancel")], {"STATEFUL-INVARIANT"}),
+    16: ("schema bounds not enforced", [("LOGIC-NEGATIVE-VALUE", "/items"), ("LOGIC-BOUND-VIOLATION", "/orders")], {"LOGIC-OVERFLOW", "LOGIC-ROUNDING"}),
     12: ("SQL injection in login", [("NEG-INJECTION", "/auth/login")], {"NEG-5XX"}),      # string-built SQL also breaks on NUL bytes (measured, absent on the clean control)
 }
 NEEDS = {8: {6}}                                    # bug -> bugs that must also be active for it to be observable

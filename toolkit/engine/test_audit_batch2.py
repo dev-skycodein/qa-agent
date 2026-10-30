@@ -247,6 +247,24 @@ def _race(monkeypatch, races):
     return r, captured
 
 
+def test_race_check_that_checks_nothing_is_degraded(monkeypatch):
+    r, _ = _race(monkeypatch, [{"name": "oversell", "n": 3,
+                                "setup": lambda api, ctx: {"method": "POST", "path": "/x", "role": "user_a", "body": {}},
+                                "check": lambda api, results, ctx: None}])
+    assert r["status"] == trust.DEGRADED and "oversell" in r["status_reason"]
+
+
+def test_race_without_a_role_uses_a_plain_role_of_any_name(monkeypatch):
+    monkeypatch.setattr(race_engine, "race", lambda method, url, n, headers, body=None, per_request_headers=None: [(201, None)] * n)
+    api = FakeApi()
+    api.roles = {"anon": {}, "buyer": {"t": "b"}, "seller": {"t": "s"}}
+    def check(api, results, ctx):
+        return len(results) and None
+    races = [{"name": "r", "n": 2, "setup": lambda api, ctx: {"method": "POST", "path": "/x", "body": {}}, "check": check}]
+    r = race_engine.run(api, {}, SimpleNamespace(RACES=races))
+    assert r["status"] == trust.RAN_OK
+
+
 def test_race_unknown_role_is_not_sent_anonymous(monkeypatch):
     r, captured = _race(monkeypatch, [{"name": "r", "n": 3,
                                        "setup": lambda api, ctx: {"method": "POST", "path": "/x", "role": "usr_a", "body": {}},
@@ -265,7 +283,7 @@ def test_race_missing_check_is_spec_error_not_invariant_finding(monkeypatch):
 def test_race_attempts_zero_runs_one_burst_and_does_not_crash(monkeypatch):
     r, captured = _race(monkeypatch, [{"name": "r", "n": 3, "attempts": 0,
                                        "setup": lambda api, ctx: {"method": "POST", "path": "/x", "role": "user_a", "body": {}},
-                                       "check": lambda api, results, ctx: None}])
+                                       "check": lambda api, results, ctx: None if results else "no response"}])
     assert len(captured) == 1
     assert r["status"] == trust.RAN_OK
 

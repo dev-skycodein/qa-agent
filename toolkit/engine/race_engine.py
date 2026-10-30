@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from race import race  # noqa: E402
-from api import TRANSPORT_ERROR  # noqa: E402
+from api import TRANSPORT_ERROR, default_owner  # noqa: E402
 import trust  # noqa: E402
 
 
@@ -44,7 +44,7 @@ def run(api, spec_doc, qa) -> dict:
                 notes.append(f"{scenario['name']}: setup failed ({type(exc).__name__}: {exc})")
                 setup_failed += 1
                 break
-            role = req.get("role", "user_a")
+            role = req.get("role", default_owner(api.roles, getattr(qa, "ADMIN_ROLE", "admin")))
             if role not in api.roles:                              # an unknown role would silently send the burst anonymous
                 notes.append(f"{scenario['name']}: role {role!r} is not a role from setup(): burst not run (it would be anonymous)")
                 setup_failed += 1
@@ -85,4 +85,8 @@ def run(api, spec_doc, qa) -> dict:
         return trust.mark(res, trust.DEGRADED, f"setup failed for {setup_failed} of {len(races)} race scenario(s)")
     if transport_lost:
         return trust.mark(res, trust.DEGRADED, f"{transport_lost} burst request(s) got no HTTP response: the race was weaker than configured")
+    empty = [str(s.get("name", "?")) for s in races if trust.checks_nothing(s.get("check"))]
+    if empty:
+        notes.append(f"race check(s) with an empty body, they can never report a violation: {', '.join(empty)}")
+        return trust.mark(res, trust.DEGRADED, f"empty race check(s) checked nothing: {', '.join(empty)}")
     return trust.mark(res, trust.RAN_OK)

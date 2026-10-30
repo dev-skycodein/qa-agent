@@ -1,13 +1,16 @@
-"""Toolkit self-test: run the generic engines against the demo Flask shop (12 planted bugs, different stack
+"""Toolkit self-test: run the /qa-hunt engines against the demo Flask shop (16 planted bugs, different stack
 from an internal test app) and assert every bug class is found. Needs only `python` + uv (downloads flask/hypothesis).
 
-  python engine/selftest.py               # ~2-4 min, exit code 0 = engines work (the canary)
+  python engine/selftest.py               # ~3-6 min, exit code 0 = engines work (the canary)
   python engine/selftest.py --with-clean  # + the same engines on the FIXED demo app: no high/medium finding allowed (false-positive control)
 
-Expected (13 checks): BOLA/IDOR, MISSING-AUTH, PRIV-ESC (authz), a stateful invariant failure, RACE-INVARIANT (oversell),
+Expected (17 checks): BOLA/IDOR, MISSING-AUTH, PRIV-ESC (authz), a stateful invariant failure, RACE-INVARIANT (oversell),
 NEG-5XX (non-integer quantity), NEG-LEAK (traceback in error body), MASS-ASSIGN (role on register), XREF-IDOR (review of
 someone else's order), CANARY-IN-EMAIL (unescaped note in HTML mail), OUTBOUND-LEAK (password sent to analytics),
-SCENARIO (illegal order status transition accepted), NEG-INJECTION on POST /auth/login (planted SQL injection).
+SCENARIO (illegal order status transition accepted), NEG-INJECTION on POST /auth/login (planted SQL injection),
+EXPOSURE-SECRET-FIELD (password in GET /me), AUTH-TOKEN-AFTER-LOGOUT, LOGIC-NEGATIVE-VALUE (bounds ignored), and a RACE-INVARIANT
+named "double cancel". Limit: the bugs are the same author's as the engines, so a pass shows the engines work, not how many
+bugs nobody thought of they would find.
 
 The canary also fails when any engine ERRORED (trust.py status), not only when a class is missing: an engine that crashed is
 not "found nothing". The clean control reuses the app with `DEMO_FIXED=1` (every planted bug fixed); a high/medium finding
@@ -28,7 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trust  # noqa: E402
 
 WANT = {"BOLA/IDOR", "MISSING-AUTH", "PRIV-ESC", "STATEFUL-INVARIANT", "RACE-INVARIANT",
-        "NEG-5XX", "NEG-LEAK", "MASS-ASSIGN", "XREF-IDOR", "CANARY-IN-EMAIL", "OUTBOUND-LEAK", "SCENARIO"}
+        "NEG-5XX", "NEG-LEAK", "MASS-ASSIGN", "XREF-IDOR", "CANARY-IN-EMAIL", "OUTBOUND-LEAK", "SCENARIO",
+        "EXPOSURE-SECRET-FIELD", "AUTH-TOKEN-AFTER-LOGOUT", "LOGIC-NEGATIVE-VALUE"}
+QA_HUNT_ENGINES = "authz,negative,stateful,race,scenario,static,auth,exposure,logic"      # keep equal to commands/qa-hunt.md
 
 
 def run_engines(out: Path, fixed: bool = False, bugs: str | None = None, engines: str | None = None, examples: int = 40,
@@ -50,8 +55,7 @@ def run_engines(out: Path, fixed: bool = False, bugs: str | None = None, engines
            sys.executable, "-m", "uv", "run", "--no-project", "--python", "3.12", "--with", "hypothesis",
            "python", str(TOOLKIT / "engine" / "run.py"), "--spec", str(DEMO / "qa-spec.py"), "--openapi", str(DEMO / "openapi.json"),
            "--out", str(out), "--examples", str(examples), "--steps", "12", "--seed", str(seed)]
-    if engines:
-        cmd += ["--engines", engines]
+    cmd += ["--engines", engines or QA_HUNT_ENGINES]
     (out / "engines.json").unlink(missing_ok=True)   # a stale file from an earlier run must never stand in for this run's output
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "PYTHONUTF8": "1"})
     for leftover in DEMO.glob("qa_demo_flask_shop.db"):
@@ -77,11 +81,13 @@ def check_planted() -> int:
     missing = WANT - kinds
     if not any(f["kind"] == "NEG-INJECTION" and "/auth/login" in f["endpoint"] for r in results for f in r.get("findings", [])):
         missing.add("NEG-INJECTION on POST /auth/login")          # a NEG-INJECTION on any other endpoint was a false positive (see check_clean)
+    if not any(f["kind"] == "RACE-INVARIANT" and "double cancel" in str(f.get("detail")) for r in results for f in r.get("findings", [])):
+        missing.add("RACE-INVARIANT named double cancel")
     print("found:", sorted(kinds))
     if missing or errors:
         print("SELFTEST FAILED: missing", sorted(missing), "engine errors", errors)
         return 1
-    print("SELFTEST OK: all 13 planted bug classes found on a non-FastAPI stack")
+    print(f"SELFTEST OK: all {len(WANT) + 2} planted bug classes found on a non-FastAPI stack")
     return 0
 
 

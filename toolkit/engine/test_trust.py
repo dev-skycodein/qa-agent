@@ -83,6 +83,70 @@ def test_run_py_broken_spec_is_an_errored_row_and_exit_2():
         assert trust.resolve(results[0])[0] == trust.ERRORED and "spec is broken" in trust.resolve(results[0])[1]
 
 
+def test_a_function_without_a_call_or_a_raise_checks_nothing():
+    def only_pass(*a):
+        pass
+
+    def only_docstring(*a):
+        """Later."""
+
+    def only_assignment(*a):
+        x = 1
+        return x
+    assert all(trust.checks_nothing(f) for f in (only_pass, only_docstring, only_assignment, lambda *a: None))
+
+
+def test_a_check_that_only_reads_its_arguments_is_a_check():
+    assert not trust.checks_nothing(lambda api, results, ctx: "oversold" if results[0][0] == 201 else None)
+
+
+def test_a_check_that_only_prints_checks_nothing():
+    def only_print(api, log, ctx):
+        print("checked")
+    assert trust.checks_nothing(only_print)
+
+
+def test_a_check_that_uses_a_global_helper_is_a_check():
+    def uses_helper():
+        return some_module_level_helper()
+    assert not trust.checks_nothing(uses_helper)
+
+
+def test_a_function_that_calls_or_asserts_is_a_check():
+    def calls(api):
+        return api.call("GET", "/x")
+
+    def asserts(log):
+        assert log
+
+    def raises(log):
+        raise AssertionError("no")
+    assert not any(trust.checks_nothing(f) for f in (calls, asserts, raises))
+
+
+def test_something_that_is_not_a_plain_function_counts_as_a_check():
+    class Check:
+        def __call__(self):
+            pass
+    assert trust.checks_nothing(Check()) is False
+
+
+def test_run_py_says_the_app_is_down_instead_of_a_bare_traceback():
+    with tempfile.TemporaryDirectory() as d:
+        spec = Path(d) / "qa-spec.py"
+        spec.write_text('def setup(api):\n    return {"a": {"t": api.call("anon", "POST", "/login", {}).json["token"]}}\n', encoding="utf-8")
+        p = _run_py(["--base-url", "http://127.0.0.1:9", "--spec", str(spec), "--out", str(Path(d) / "out")])
+        assert p.returncode == 2
+        assert "did not answer" in (Path(d) / "out" / "engines.md").read_text(encoding="utf-8")
+
+
+def test_setup_hint_stays_quiet_when_the_app_answered():
+    import run
+    assert run._setup_hint([{"status": 200}, {"status": 599}]) == ""
+    assert run._setup_hint([]) == ""
+    assert "did not answer" in run._setup_hint([{"status": 599}])
+
+
 def test_cross_check_downgrades_ran_ok_with_zero_probes():
     r = trust.mark({"engine": "authz", "findings": [], "probes": 0}, trust.RAN_OK)
     trust.cross_check([r], request_count=5)

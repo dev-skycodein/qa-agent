@@ -883,7 +883,7 @@ def _role(st, k) -> str:
     if k in st.public:
         cands = ["anon"]
     else:
-        owner = st.owner.get(k, "user_a")
+        owner = st.owner.get(k, api.default_owner(st.client.roles))
         if owner in st.client.roles:
             cands = [owner]
         else:

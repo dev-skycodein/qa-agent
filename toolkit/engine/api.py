@@ -3,6 +3,7 @@ and a role-aware HTTP client that only talks to local hosts. Stdlib only (hypoth
 imported lazily by `strategy`)."""
 import http.client
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -14,6 +15,8 @@ WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 BODY_CAP = 8000          # chars of each response kept in api.log["body"]
 MAX_READ = 4_000_000       # bytes read from any one response; a hostile or buggy app cannot make the engine hold a huge body
+FULL_BODY_BUDGET = 64_000_000   # chars of over-cap 2xx bodies kept per run in api.log["full_body"], for engines that must read a whole response
+STALL_LIMIT = 3          # lost requests in a row after which the app counts as stopped: no more traffic, the run ends with a report
 TRANSPORT_ERROR = 599    # pseudo-status: no HTTP response at all (refused, reset, timeout). NOT a server answer, so not a 5xx finding
 
 
@@ -68,6 +71,23 @@ def local_url(base: str, path: str) -> str:
     return url
 
 
+def plain_roles(roles, admin_role="admin") -> list:
+    """Every role that is neither anon nor the admin, in setup() order. Role names are the spec's own (buyer, seller, ...)."""
+    return [r for r in roles if r not in ("anon", admin_role)]
+
+
+def default_owner(roles, admin_role="admin") -> str:
+    """The role that creates samples when OWNER does not say: user_a when it exists, else the first plain role."""
+    plain = plain_roles(roles, admin_role)
+    return "user_a" if "user_a" in plain or not plain else plain[0]
+
+
+def attacker_for(roles, owner, admin_role="admin"):
+    """The plain role that attacks `owner`'s resources: user_b when it can, else the first other plain role. None when there is none."""
+    others = [r for r in plain_roles(roles, admin_role) if r != owner]
+    return "user_b" if "user_b" in others else next(iter(others), None)
+
+
 class Resp:
     def __init__(self, status: int, text: str, headers=None):
         self.status, self.text, self.headers = status, text, headers or {}
@@ -101,6 +121,10 @@ class Api:
         self.base = base_url.rstrip("/")
         self.roles = {"anon": {}, **(roles or {})}
         self.log: list[dict] = []
+        self.full_body_budget = FULL_BODY_BUDGET
+        self.timeout = float(os.environ.get("QA_REQUEST_TIMEOUT") or 30)   # seconds per socket operation
+        self.lost = []                 # the current run of requests that got no HTTP answer
+        self.stalled = None            # the first of them once STALL_LIMIT is reached: {"role", "method", "path", "request"}
 
     @property
     def base_url(self) -> str:
@@ -118,19 +142,30 @@ class Api:
         headers = {"Content-Type": "application/json", **self.roles.get(role, {}), **(headers or {})}
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         msg = None
-        try:
-            with _OPENER.open(req, timeout=30) as r:
-                msg = r.headers
-                resp = Resp(r.status, r.read(MAX_READ).decode("utf-8", "replace"), dict(r.headers))
-        except urllib.error.HTTPError as e:
-            msg = e.headers
-            resp = Resp(e.code, e.read(MAX_READ).decode("utf-8", "replace"), dict(e.headers))
-        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, http.client.HTTPException) as e:
-            resp = Resp(TRANSPORT_ERROR, f"connection error: {e}")
+        if self.stalled:                                        # one frozen app must not cost 30 seconds per remaining probe
+            resp = Resp(TRANSPORT_ERROR, "connection error: not sent, the app stopped answering earlier in this run")
+        else:
+            try:
+                with _OPENER.open(req, timeout=self.timeout) as r:
+                    msg = r.headers
+                    resp = Resp(r.status, r.read(MAX_READ).decode("utf-8", "replace"), dict(r.headers))
+            except urllib.error.HTTPError as e:
+                msg = e.headers
+                resp = Resp(e.code, e.read(MAX_READ).decode("utf-8", "replace"), dict(e.headers))
+            except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, http.client.HTTPException) as e:
+                resp = Resp(TRANSPORT_ERROR, f"connection error: {e}")
+            self.lost = self.lost + [{"role": role, "method": method, "path": path, "request": json.dumps(body, default=str)[:300]}] if resp.transport else []
+            if len(self.lost) >= STALL_LIMIT:
+                self.stalled = self.lost[0]
         self.log.append({"role": role, "method": method, "path": path, "status": resp.status,
                          "request": body if raw is None else "<raw>", "response": resp.text[:300], "query": query,
                          "body": resp.text[:BODY_CAP],          # full-ish body for the invariant miner; "response" stays short for reports
                          "resp_headers": header_dict(msg)})     # every response header; Set-Cookie values all kept
+        if len(resp.text) > BODY_CAP:
+            self.log[-1]["truncated"] = True                    # "body" is not valid JSON now: readers must not take it for a whole response
+            if resp.ok and len(resp.text) <= self.full_body_budget:
+                self.log[-1]["full_body"] = resp.text
+                self.full_body_budget -= len(resp.text)
         return resp
 
 

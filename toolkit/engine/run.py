@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -50,6 +51,24 @@ def _broken(engine: str, what: str, tail: int) -> dict:
     return {"engine": engine, "findings": [], "engine-error": what + "\n" + traceback.format_exc()[-tail:]}
 
 
+def _setup_hint(log: list) -> str:
+    """Why setup() probably failed, when every request it sent got no HTTP answer."""
+    if log and all(e["status"] == api_mod.TRANSPORT_ERROR for e in log):
+        return "the app did not answer at --base-url: is it running on that port?"
+    return ""
+
+
+def _stall_row(stalled: dict) -> dict:
+    """The report row for an app that stopped answering. The first lost request is the prime suspect, not proof: reproduce it."""
+    route = f"{stalled['method']} {stalled['path']}"
+    finding = {"kind": "APP-UNRESPONSIVE", "severity": "high", "endpoint": route,
+               "detail": f"the app stopped answering after this request (role {stalled['role']}, body {stalled['request']}): it hung or crashed. "
+                         "Candidate denial of service: send it again to one running app and watch whether other routes still answer"}
+    return trust.mark({"engine": "app-health", "findings": [finding], "notes": [
+        f"the run ended early: restart the app, put {route!r} in SKIP (or NEG_SKIP), and run again so the other engines can finish"]},
+        trust.DEGRADED, f"the app stopped answering after {route}")
+
+
 def finish(results: list, out: Path, a) -> int:
     """Write engines.json / engines.md / trust.json, print the report, return the exit code (exit codes: trust.exit_code)."""
     out.mkdir(parents=True, exist_ok=True)
@@ -83,7 +102,7 @@ def finish(results: list, out: Path, a) -> int:
 # Spec keys the engines use when present; an empty one means that engine reports DEGRADED or SKIPPED.
 PREFLIGHT_OPTIONAL = {
     "BODIES": "negative engine: without it, DEGRADED for each route that creates data",
-    "OWNER": "authz engine: which role owns the samples it creates (default user_a)",
+    "OWNER": "authz engine: which role owns the samples it creates (default user_a, else the first non-admin role)",
     "IDS": "authz engine: ids for admin-only routes that take a path parameter",
     "INVARIANTS": "stateful engine: extra checks; without it only the no-5xx check runs",
     "RACES": "race engine: without it, SKIPPED",
@@ -105,6 +124,31 @@ def preflight(qa, doc, roles) -> int:
             method, _, path = str(entry).partition(" ")
             if path not in paths or method.lower() not in (paths.get(path) or {}):
                 problems.append(f"{name} entry {entry!r} is not an operation in the OpenAPI document")
+    if roles:
+        admin_role = getattr(qa, "ADMIN_ROLE", "admin")
+        plain = api_mod.plain_roles(roles, admin_role)
+        if len(plain) < 2:
+            problems.append(f"setup() returned {len(plain)} non-admin role(s): authz and negative need two non-admin roles, or no user "
+                            "can attack another. Two accounts of the same user type are enough "
+                            f"(the admin role is {admin_role!r}; set ADMIN_ROLE if yours has another name)")
+        if admin_role not in roles and (getattr(qa, "ADMIN_ONLY", None) or any("/admin" in p for p in paths)):
+            problems.append(f"ADMIN_ROLE {admin_role!r} is not a role from setup(), but the spec has admin-only routes: "
+                            "name the admin role in ADMIN_ROLE, or return it from setup()")
+        elif admin_role not in roles:
+            looks_admin = [r for r in plain if re.search(r"admin|root|super", r, re.I)]
+            text = f"ADMIN_ROLE {admin_role!r} is not a role from setup(): every role is treated as an ordinary user"
+            if looks_admin:
+                problems.append(f"{text}, including {looks_admin[0]!r}. Set ADMIN_ROLE = {looks_admin[0]!r} if that is the admin")
+            else:
+                notes.append(f"{text}. Set ADMIN_ROLE if one of them is the admin")
+        for route, owner in sorted((getattr(qa, "OWNER", None) or {}).items()):
+            if owner not in roles:
+                problems.append(f"OWNER[{route!r}] names role {owner!r}, which setup() did not return: {sorted(roles)}")
+    for name in stateful.empty_invariants(qa):
+        problems.append(f"invariant {name} has an empty body: it can never fail. Write the check, or remove it from INVARIANTS")
+    for race in getattr(qa, "RACES", None) or []:
+        if isinstance(race, dict) and trust.checks_nothing(race.get("check")):
+            problems.append(f"race {race.get('name', '?')!r} has an empty check: it can never report a violation. Write the check")
     for key, why in PREFLIGHT_OPTIONAL.items():
         if not getattr(qa, key, None):
             notes.append(f"{key} is empty: {why}")
@@ -149,7 +193,11 @@ def main():
         roles = qa.setup(api) if hasattr(qa, "setup") else {}
         api.roles.update(roles or {})
     except (Exception, SystemExit):                                        # a setup() that calls sys.exit() is a failed setup
-        sys.exit(finish([_broken("setup", "qa-spec setup() failed", 1200)], out, a))
+        broken = _broken("setup", "qa-spec setup() failed", 1200)
+        hint = _setup_hint(api.log)
+        if hint:
+            broken["engine-error"] += "\n" + hint
+        sys.exit(finish([broken], out, a))
     openapi_src = a.openapi or getattr(qa, "OPENAPI", None) or a.base_url.rstrip("/") + "/openapi.json"
     try:
         doc = api_mod.load_openapi(openapi_src)
@@ -173,6 +221,9 @@ def main():
              "engine_order": primary},
             trust.RAN_OK, f"shuffled order: {','.join(primary)}"))
     for name in primary:
+        if api.stalled:
+            results.append({"engine": name, "findings": [], "engine-error": f"did not run: the app stopped answering after {api.stalled['method']} {api.stalled['path']}"})
+            continue
         try:
             if name == "authz":
                 results.append(authz_matrix.run(api, doc, qa))
@@ -202,6 +253,8 @@ def main():
                                 "engine-error": f"unknown engine {name!r}: nothing ran"})
         except (Exception, SystemExit):  # engine bug, sys.exit() inside an engine, or unsupported app: report, keep going
             results.append({"engine": name, "findings": [], "engine-error": traceback.format_exc()[-1200:]})
+        if api.stalled and trust.resolve(results[-1])[0] == trust.RAN_OK:
+            trust.mark(results[-1], trust.DEGRADED, "the app stopped answering during this engine: the rest of its probes were not sent")
 
     try:
         results.append(dbcheck.run(qa))
@@ -245,6 +298,9 @@ def main():
             results.append(exposure.run(api, doc, qa))
         except Exception:
             results.append({"engine": "exposure", "findings": [], "engine-error": traceback.format_exc()[-800:]})
+
+    if api.stalled:
+        results.insert(0, _stall_row(api.stalled))
 
     limited = sum(1 for entry in api.log if entry["status"] == 429)
     if limited:

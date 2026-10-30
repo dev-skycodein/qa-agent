@@ -26,7 +26,7 @@ From the repository folder (the folder that contains `qa_check.py`):
 ```
 python qa_check.py --quick
 ```
-It takes about 10 minutes and runs a small demo app with planted bugs. The last lines should read `VERDICT: no FAIL - toolkit checks green`. Do not start a second selftest while it runs (they share port 8765).
+It takes about 15 minutes (longer the first time) and runs the whole test suite, then a small demo app with planted bugs. The last lines should read `VERDICT: no FAIL - toolkit checks green`. Do not start a second selftest while it runs (they share port 8765).
 
 ## Step 2: write your spec file
 The engines need a Python file that tells them your users, your routes and how to create data. Start from the demo:
@@ -35,7 +35,7 @@ The engines need a Python file that tells them your users, your routes and how t
 2. Change it:
    - `PUBLIC`: routes anyone may call without logging in, written like `"GET /items"`.
    - `ADMIN_ONLY`: routes only an admin may call.
-   - `USERS`: test users (dummy emails).
+   - `USERS`: test users (dummy emails). You need two ordinary users and one admin. Role names are yours (`buyer`, `seller`); if the admin is not called `admin`, set `ADMIN_ROLE`.
    - `setup(api)`: log in each user and return their auth headers. **Check the login response key**: the template uses `access_token`, the demo uses `token`. Use the key your API really returns.
    - `BODIES`: a valid request body for each route that creates data.
    - `OWNER`: which user owns the samples the engines create.
@@ -64,7 +64,7 @@ python -m uv run --no-project --python 3.12 --with hypothesis --with requests --
 ```
 Change the port, the spec path and the OpenAPI path to match your setup. Drop `--with pymongo` if your spec does not import it.
 
-**`--engines` replaces the whole default list.** It does not add to it. If you pass `--engines`, list every engine you want, for example `--engines authz,negative,stateful,schema,auth,exposure`. The engines `dbcheck` and `coverage` always run, whatever you pass.
+**`--engines` replaces the whole default list.** It does not add to it. If you pass `--engines`, list every engine you want, for example `--engines authz,negative,stateful,race,scenario,static,auth,exposure,logic` (the `/qa-hunt` list). The engines `dbcheck` and `coverage` always run, whatever you pass.
 
 ## Which engines need what
 | Engine | Needs in your spec | Without it |
@@ -84,6 +84,7 @@ Open `../my-api/qa-results/engines.md` (readable) or `engines.json` (for scripts
 
 - **A finding is a lead, not a verdict.** Repeat the request sequence it shows, and check it against the behaviour you intend, before you call it a bug.
 - **`RAN_OK` with no findings** means the checks ran and found nothing. It does **not** mean the API is correct.
+- **`APP-UNRESPONSIVE` in the `app-health` row** means your app stopped answering (3 requests in a row got no answer, 30 seconds each; `QA_REQUEST_TIMEOUT` changes that). The run stops sending traffic and names the first of those requests. Check whether that request really freezes your app, then put the route in `SKIP` or `NEG_SKIP`, restart the app and run again, because the engines after it did not run.
 - **`DEGRADED`, `SKIPPED` or `ERRORED`** means part of the check did not run. Read the note, fix the spec, and run again.
 - **A finding that also appears on a fixed copy of your app** is probably a false positive.
 - Random engines (`stateful`, `race`) can miss things on one run. Run again, or use `--seed N`.

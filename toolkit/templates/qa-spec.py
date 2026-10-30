@@ -10,6 +10,7 @@ finding or a note in engines.md asks for it. Everything runs against a LOCAL app
 # ---------- 1. REQUIRED: who are the actors? ----------
 def setup(api):
     """Called once. Create/log in users and return {"user_a": headers, "user_b": headers, "admin": headers}.
+    Role names are yours (buyer, seller, ...): you need two ordinary users, plus the admin (set ADMIN_ROLE if it is not "admin").
     api.call(role, method, path, body) -> Resp(.status .json .text .ok). 'anon' needs no headers."""
     roles = {}
     for role, email in {"user_a": "qa-a@qa.dev", "user_b": "qa-b@qa.dev", "admin": "qa-admin@qa.dev"}.items():
@@ -28,7 +29,8 @@ def fresh_state(api):
 
 def no_negative_balance(api, log, ctx):
     """Invariant: raise AssertionError with a clear message when broken. `log` = every request so far
-    [{role, method, path, status, request, response}]; query current state with api.call(...)."""
+    [{role, method, path, status, request, response}]; query current state with api.call(...).
+    Fill this in: while the body is empty, --preflight reports a PROBLEM and the stateful engine reports DEGRADED."""
     # assert api.call("admin", "GET", "/me").json["balance"] >= 0, "negative balance"
 
 
@@ -39,7 +41,7 @@ PUBLIC = {"POST /auth/register", "POST /auth/login", "GET /health"}      # "METH
 ADMIN_ONLY = set()                                                       # "/admin..." paths are added automatically
 
 # ---------- optional knobs ----------
-OWNER = {}            # {"POST /orders": "user_a"}  role that creates the resource other roles then attack (default user_a)
+OWNER = {}            # {"POST /orders": "user_a"}  role that creates the resource other roles then attack (default user_a, else the first non-admin role)
 BODIES = {}           # {"POST /orders": {...}}     ONE valid body per endpoint for authz probes (stateful ignores these and generates random bodies)
 BODY_HOOKS = {}       # {"POST /orders": lambda body, ctx: {**body, "item_id": ctx["item"]}}  patch generated bodies with real ids
 IDS = {}              # {"user_id": "<id of a throwaway user>"}  for admin-only endpoints that take a path param

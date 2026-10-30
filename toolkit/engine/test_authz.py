@@ -32,7 +32,7 @@ class FakeApi:
             if role == "anon":
                 return api_mod.Resp(401, "{}")
             oid = len(self.orders) + 1
-            self.orders[oid] = {"id": oid, "owner": role, "qty": (body or {}).get("qty", 1)}
+            self.orders[oid] = {"id": oid, "owner": role, "qty": (body or {}).get("qty", 1), "status": "new"}
             return api_mod.Resp(201, __import__("json").dumps(self.orders[oid]))
         oid = int(parts[1])
         order = self.orders.get(oid)
@@ -59,6 +59,47 @@ class FakeApi:
 
 def _run(mode):
     return authz_matrix.run(FakeApi(mode), SPEC, SimpleNamespace(PUBLIC={"POST /orders"}))
+
+
+def _run_as(roles, mode="leak", **spec):
+    fake = FakeApi(mode)
+    fake.roles = {"anon": {}, **{r: {"t": r} for r in roles}}
+    return authz_matrix.run(fake, SPEC, SimpleNamespace(PUBLIC={"POST /orders"}, **spec))
+
+
+def test_role_names_do_not_have_to_be_user_a_and_user_b():
+    r = _run_as(["buyer", "seller", "admin"])
+    assert {(f["kind"], f["role"]) for f in r["findings"] if f["endpoint"] == "GET /orders/{order_id}"} >= {("BOLA/IDOR", "seller")}
+
+
+def test_the_admin_is_not_picked_as_the_attacker():
+    r = _run_as(["admin", "buyer", "seller"])
+    assert "admin" not in {f["role"] for f in r["findings"]}
+
+
+def test_a_resource_owned_by_user_b_is_attacked_by_user_a():
+    r = _run_as(["user_a", "user_b"], OWNER={"POST /orders": "user_b"})
+    assert ("BOLA/IDOR", "user_a") in {(f["kind"], f["role"]) for f in r["findings"]}
+
+
+def test_one_plain_role_is_degraded_because_nobody_can_attack_it():
+    r = _run_as(["buyer", "admin"], mode="deny")
+    assert r["status"] == trust.DEGRADED and any("BOLA" in n and "second" in n for n in r["notes"])
+
+
+class OpenAdminApi:
+    """Every call answers 200: a plain user reaches the admin route."""
+    def __init__(self):
+        self.roles, self.log = {"anon": {}, "buyer": {"t": "b"}, "seller": {"t": "s"}, "admin": {"t": "x"}}, []
+
+    def call(self, role, method, path, body=None, query=None, raw=None, headers=None):
+        return api_mod.Resp(200, "{}")
+
+
+def test_admin_route_is_probed_with_a_plain_role_of_any_name():
+    spec = {"paths": {"/admin/reset": {"post": {"summary": "reset"}}}}
+    r = authz_matrix.run(OpenAdminApi(), spec, SimpleNamespace(PUBLIC=set()))
+    assert ("PRIV-ESC", "buyer") in {(f["kind"], f["role"]) for f in r["findings"]}
 
 
 BOOK_SPEC = {"paths": {
@@ -195,6 +236,14 @@ def test_delete_readback_does_not_fall_back_to_parent():
     before = api_mod.Resp(200, '{"id": 5}')                                                 # owner saw the order before the DELETE
     kind, sev, _ = authz_matrix._write_readback(GoneApi(), "user_a", {"method": "DELETE"}, "/orders/5", None, api_mod.Resp(200, "{}"), before)
     assert (kind, sev) == ("BOLA/IDOR", "high"), kind
+
+
+def test_write_2xx_on_a_field_nobody_can_read_back_is_a_finding_not_only_a_note():
+    # a password change on another user's account: 2xx, and no read-back can ever show it
+    qa = SimpleNamespace(PUBLIC={"POST /orders"}, BODIES={"PATCH /orders/{order_id}": {"password": "changed"}})
+    r = authz_matrix.run(FakeApi("write_ok_no_effect"), SPEC, qa)
+    hits = [f for f in r["findings"] if f["kind"] == "AUTHZ-WRITE-UNVERIFIED"]
+    assert [(f["role"], f["severity"]) for f in hits] == [("user_b", "medium")] and "not proven" in hits[0]["detail"]
 
 
 def test_write_2xx_without_visible_effect_by_user_is_noted_anon_is_missing_auth():

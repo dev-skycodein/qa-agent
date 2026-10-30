@@ -553,3 +553,8 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+def test_pick_role_uses_a_plain_role_of_any_name():
+    api = SimpleNamespace(roles={"anon": {}, "admin": {"t": "x"}, "buyer": {"t": "b"}})
+    assert d._pick_role(api, SimpleNamespace(), {"role": None, "key": "POST /x"}) == "buyer"
